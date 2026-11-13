@@ -1,0 +1,196 @@
+// ==UserScript==
+// @name         Spotify Miniplayer Unlocker
+// @namespace    https://open.spotify.com/
+// @version      2.0.1
+// @description  Removes the Premium resize popup in Spotify's miniplayers
+// @match        https://open.spotify.com/*
+// @license      MIT
+// @grant        unsafeWindow
+// @run-at       document-start
+// @downloadURL https://update.greasyfork.org/scripts/575382/Spotify%20Miniplayer%20Unlocker.user.js
+// @updateURL https://update.greasyfork.org/scripts/575382/Spotify%20Miniplayer%20Unlocker.meta.js
+// ==/UserScript==
+(function () {
+    'use strict';
+    var DEBUG = false;
+    var BLOCK_PROGRAMMATIC_RESIZE = true;
+    var LEGACY_SELECTORS = ['.gDrPbJQiN4Ij2XGL'];
+    var STABLE_SELECTORS = [
+        '[role="dialog"]',
+        '[role="alertdialog"]',
+        '[data-encore-id="popover"]',
+        '[data-encore-id="dialogConfirmation"]',
+        '[data-testid*="premium" i]',
+        '[data-testid*="upsell" i]',
+        '[data-testid*="upgrade" i]',
+        '[data-testid*="resize" i]'
+    ];
+    var CANDIDATES = LEGACY_SELECTORS.concat(STABLE_SELECTORS).join(',');
+    var TEXT_RE    = /premium|resiz/i;
+    var DISMISS_RE = /not now|no thanks|maybe later|dismiss|close|cancel|got it/i;
+    var PLAYER_GUARD = [
+        '[data-testid="control-button-playpause"]',
+        '[data-testid="control-button-skip-forward"]',
+        '[data-testid="player-controls"]',
+        '.VideoPlayer__container'
+    ].join(',');
+    function log() {
+        if (DEBUG) console.log.apply(console, ['[SMU]'].concat([].slice.call(arguments)));
+    }
+    var clicked = new WeakSet();
+    function looksLikePopup(el) {
+        if (el.matches(LEGACY_SELECTORS.join(','))) return true;
+        var text = el.textContent || '';
+        if (text.length > 800 || !TEXT_RE.test(text)) return false;
+        if (!el.querySelector('button, [role="button"], a')) return false;
+        if (el.querySelector(PLAYER_GUARD)) return false;
+        return true;
+    }
+    function labelOf(btn) {
+        return ((btn.getAttribute('aria-label') || '') + ' ' + (btn.textContent || '')).trim();
+    }
+    function dismiss(popup) {
+        if (clicked.has(popup)) return;
+        clicked.add(popup);
+        var buttons = [].slice.call(popup.querySelectorAll('button, [role="button"]'));
+        var target = null;
+        for (var i = 0; i < buttons.length; i++) {
+            if (DISMISS_RE.test(labelOf(buttons[i]))) { target = buttons[i]; break; }
+        }
+        if (!target) {
+            var tert = popup.querySelectorAll('[data-encore-id="buttonTertiary"]');
+            target = tert[tert.length - 1] || null;
+        }
+        if (target) {
+            log('dismissing via', labelOf(target));
+            target.click();
+        }
+    }
+    function hide(popup, doc) {
+        var node = popup;
+        var stop = [doc.body, doc.documentElement, doc.getElementById('main'), doc.getElementById('root')];
+        while (node.parentElement &&
+               stop.indexOf(node.parentElement) === -1 &&
+               node.parentElement.children.length === 1 &&
+               !node.parentElement.querySelector(PLAYER_GUARD)) {
+            node = node.parentElement;
+        }
+        node.style.setProperty('display', 'none', 'important');
+        popup.style.setProperty('display', 'none', 'important');
+    }
+    function bodyTextLength(node) {
+        var total = (node.textContent || '').length;
+        var inner = node.querySelectorAll('button, [role="button"], a');
+        for (var i = 0; i < inner.length; i++) total -= (inner[i].textContent || '').length;
+        return total;
+    }
+    function scanByDismissButton(doc) {
+        var buttons = doc.querySelectorAll('button, [role="button"], a');
+        for (var i = 0; i < buttons.length; i++) {
+            var btn = buttons[i];
+            if (!/^\s*not now\s*$/i.test(btn.textContent || '')) continue;
+            var node = btn.parentElement;
+            while (node &&
+                   node !== doc.body &&
+                   node !== doc.documentElement &&
+                   !(/premium/i.test(node.textContent || '') && bodyTextLength(node) > 20)) {
+                node = node.parentElement;
+            }
+            if (!node || node === doc.body || node === doc.documentElement) continue;
+            if (node.querySelector(PLAYER_GUARD)) continue;
+            while (node.parentElement &&
+                   node.parentElement !== doc.body &&
+                   node.parentElement !== doc.documentElement &&
+                   !node.parentElement.querySelector(PLAYER_GUARD) &&
+                   (node.parentElement.textContent || '').length === (node.textContent || '').length) {
+                node = node.parentElement;
+            }
+            log('popup found via Not now button', node);
+            if (!clicked.has(node)) {
+                clicked.add(node);
+                btn.click();
+            }
+            hide(node, doc);
+        }
+    }
+    function scan(doc) {
+        var found;
+        try { found = doc.querySelectorAll(CANDIDATES); } catch (e) { return; }
+        for (var i = 0; i < found.length; i++) {
+            var el = found[i];
+            if (!looksLikePopup(el)) continue;
+            log('popup found', el);
+            dismiss(el);
+            hide(el, doc);
+        }
+        try { scanByDismissButton(doc); } catch (e) {}
+    }
+    var injected = new WeakSet();
+    function injectIntoPiP(pipWin) {
+        if (!pipWin || injected.has(pipWin)) return;
+        injected.add(pipWin);
+        var doc = pipWin.document;
+        try {
+            if (!doc.getElementById('smu-suppress')) {
+                var style = doc.createElement('style');
+                style.id = 'smu-suppress';
+                style.textContent = LEGACY_SELECTORS.join(',') + ' { display: none !important; }';
+                (doc.head || doc.documentElement).appendChild(style);
+            }
+        } catch (e) {}
+        var timer = null;
+        function schedule() {
+            if (timer) return;
+            timer = pipWin.setTimeout(function () { timer = null; scan(doc); }, 50);
+        }
+        var observer = new pipWin.MutationObserver(schedule);
+        observer.observe(doc.documentElement, { childList: true, subtree: true });
+        pipWin.addEventListener('pagehide', function () { observer.disconnect(); });
+        pipWin.addEventListener('load', schedule);
+        pipWin.addEventListener('resize', schedule);
+        var poll = pipWin.setInterval(schedule, 500);
+        pipWin.addEventListener('pagehide', function () { pipWin.clearInterval(poll); });
+        scan(doc);
+        if (BLOCK_PROGRAMMATIC_RESIZE) {
+            ['resizeTo', 'resizeBy'].forEach(function (name) {
+                try {
+                    Object.defineProperty(pipWin, name, {
+                        value: function () {  },
+                        configurable: true,
+                        writable: true
+                    });
+                } catch (e) {
+                    try { pipWin[name] = function () {}; } catch (e2) {}
+                }
+            });
+        }
+        log('injected into PiP window');
+    }
+    var hookTries = 0;
+    function hookPiP() {
+        var pip;
+        try { pip = unsafeWindow.documentPictureInPicture; } catch (e) {}
+        if (!pip) {
+            if (++hookTries < 25) setTimeout(hookPiP, 400);
+            return;
+        }
+        if (pip.__smu__) return;
+        pip.__smu__ = true;
+        var orig = pip.requestWindow.bind(pip);
+        pip.requestWindow = function (opts) {
+            return orig(opts).then(function (pipWin) {
+                injectIntoPiP(pipWin);
+                return pipWin;
+            });
+        };
+        if (pip.window) injectIntoPiP(pip.window);
+    }
+    function pollForPiP() {
+        try {
+            var pip = unsafeWindow.documentPictureInPicture;
+            if (pip && pip.window) injectIntoPiP(pip.window);
+        } catch (e) {}
+    }
+    hookPiP();
+    setInterval(pollForPiP, 1000);
+})();
