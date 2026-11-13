@@ -1,0 +1,456 @@
+// ==UserScript==
+// @name         Chess.com User Check (Ranged)
+// @namespace    https://www.chess.com/
+// @version      1.0
+// @description  Checks chess.com username availability via the public API, using a min-max length range
+// @match        https://www.chess.com/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      api.chess.com
+// @connect      api.urbandictionary.com
+// @connect      api.datamuse.com
+// @connect      od-api.oxforddictionaries.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ---------- settings ---------- */
+  const DEF = {
+    minLen: 3, maxLen: 6, mode: 'random', letters: true, numbers: true, underscore: false, hyphen: false,
+    urban: true, datamuse: true, oxford: false,
+    oxId: '', oxKey: '', delay: 1, dumpSize: 100, x: 360, y: 80, h: 600
+  };
+  const S = Object.assign({}, DEF, GM_getValue('chesscheck', {}));
+  const save = () => GM_setValue('chesscheck', S);
+  S.minLen = Math.max(3, Math.min(25, S.minLen));
+  S.maxLen = Math.max(S.minLen, Math.min(25, S.maxLen));
+
+  // chess.com username rules:
+  // 3-25 chars, at least 1 letter, starts with a letter or number,
+  // only letters/numbers/hyphens/underscores, and every hyphen/underscore is followed by a letter or number
+  const valid = n => n.length >= 3 && n.length <= 25 && /[a-z]/.test(n) &&
+    /^[a-z0-9]([a-z0-9]|[-_](?=[a-z0-9]))*$/.test(n);
+
+  /* ---------- state ---------- */
+  let running = false, dumping = false;
+  const checked = new Set();
+  const pools = {};
+  let incLen = S.minLen;
+  let counter = 0;
+  let stats = { total: 0, free: 0, taken: 0 };
+  const free = [];
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const rnd = n => Math.floor(Math.random() * n);
+  const resetInc = () => { incLen = S.minLen; counter = 0; };
+
+  /* ---------- GUI ---------- */
+  const css = `
+  #ccr{position:fixed !important;z-index:999999 !important;width:320px !important;background:#1b2030 !important;color:#e8ebf5 !important;
+    font:13px system-ui,sans-serif !important;border:1px solid #3a4260 !important;border-radius:10px !important;
+    box-shadow:0 6px 24px #0009 !important;display:flex !important;flex-direction:column !important;
+    min-height:160px !important;max-height:95vh !important}
+  #ccr *{box-sizing:border-box !important;font-family:system-ui,sans-serif;letter-spacing:normal !important}
+  #ccr .h{padding:8px 10px;cursor:move;background:#262d45;border-radius:10px 10px 0 0;font-weight:700;
+    display:flex;justify-content:space-between;flex:0 0 auto;font-size:14px !important}
+  #ccr .b{padding:10px;display:flex;flex-direction:column;gap:10px;flex:1 1 auto;overflow-y:auto;min-height:0}
+  #ccr .b > *{flex-shrink:0 !important}
+  #ccr label{display:flex !important;align-items:center;gap:6px;font-size:13px !important;margin:0 !important;width:auto !important}
+  #ccr input[type=range]{flex:1;width:auto !important;height:auto !important;padding:0 !important}
+  #ccr input[type=checkbox],#ccr input[type=radio]{width:16px !important;height:16px !important;min-width:16px;margin:0 !important;padding:0 !important;flex:0 0 auto}
+  #ccr input[type=text],#ccr input[type=number],#ccr input[type=password]{
+    width:100% !important;height:34px !important;background:#121622 !important;color:#fff !important;
+    border:1px solid #3a4260 !important;border-radius:5px !important;padding:4px 8px !important;font-size:13px !important;margin:0 !important}
+  #ccr #ccr-delay{width:120px !important}
+  #ccr select{background:#121622 !important;color:#fff !important;border:1px solid #3a4260 !important;border-radius:6px !important;
+    padding:6px !important;font-size:13px !important;height:auto !important;margin:0 !important}
+  #ccr button{background:#3b5bdb !important;color:#fff !important;border:0 !important;border-radius:6px !important;
+    padding:8px !important;cursor:pointer;font-weight:600 !important;font-size:13px !important;height:auto !important}
+  #ccr button.stop{background:#c92a2a !important}
+  #ccr button.alt{background:#3a4260 !important}
+  #ccr fieldset{border:1px solid #3a4260 !important;border-radius:6px !important;padding:8px !important;margin:0 !important;
+    display:flex !important;flex-direction:column;gap:6px;min-width:0}
+  #ccr legend{padding:0 4px !important;color:#9aa5cf !important;width:auto !important;font-size:12px !important}
+  #ccr .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  #ccr .log{background:#121622;border-radius:5px;padding:6px;font:12px monospace !important;
+    white-space:pre-wrap;border:1px solid #3a4260}
+  #ccr .ok{color:#51cf66}.no{color:#ff6b6b}.mu{color:#9aa5cf}
+  #ccr textarea{width:100% !important;background:#121622 !important;
+    color:#51cf66 !important;border:1px solid #3a4260 !important;border-radius:5px !important;
+    font:12px monospace !important;padding:6px !important;margin:0 !important}
+  #ccr .grip{flex:0 0 auto;height:14px;cursor:ns-resize;background:#262d45;border-radius:0 0 10px 10px;position:relative}
+  #ccr .grip::after{content:'';position:absolute;left:50%;top:5px;width:40px;margin-left:-20px;height:4px;border-radius:2px;background:#5a6490}
+  `;
+  const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+
+  const box = document.createElement('div');
+  box.id = 'ccr';
+  box.style.left = S.x + 'px'; box.style.top = S.y + 'px'; box.style.height = S.h + 'px';
+  box.innerHTML = `
+    <div class="h"><span>Chess.com User Check (Ranged)</span><span id="ccr-min" style="cursor:pointer;padding:0 6px">–</span></div>
+    <div class="b" id="ccr-body">
+      <fieldset><legend>Length range</legend>
+        <label>Min: <b id="ccr-minv" style="min-width:20px"></b>
+          <input type="range" id="ccr-minlen" min="3" max="25"></label>
+        <label>Max: <b id="ccr-maxv" style="min-width:20px"></b>
+          <input type="range" id="ccr-maxlen" min="3" max="25"></label>
+      </fieldset>
+      <fieldset><legend>Mode</legend>
+        <label><input type="radio" name="ccr-mode" value="random"> Random</label>
+        <label><input type="radio" name="ccr-mode" value="words"> Words</label>
+        <label><input type="radio" name="ccr-mode" value="increasing"> Increasing</label>
+      </fieldset>
+      <fieldset><legend>Characters</legend>
+        <div class="row">
+          <label><input type="checkbox" id="ccr-letters"> Letters</label>
+          <label><input type="checkbox" id="ccr-numbers"> Numbers</label>
+          <label><input type="checkbox" id="ccr-underscore"> Underscore</label>
+          <label><input type="checkbox" id="ccr-hyphen"> Hyphen</label>
+        </div>
+      </fieldset>
+      <fieldset><legend>Word sources (Words mode)</legend>
+        <label><input type="checkbox" id="ccr-urban"> Urban Dictionary</label>
+        <label><input type="checkbox" id="ccr-datamuse"> Datamuse (English words)</label>
+        <label><input type="checkbox" id="ccr-oxford"> Oxford (needs API keys)</label>
+        <input type="text" id="ccr-oxid" placeholder="Oxford app_id" autocomplete="off" name="ccr_x1" data-lpignore="true">
+        <input type="password" id="ccr-oxkey" placeholder="Oxford app_key" autocomplete="new-password" name="ccr_x2" data-lpignore="true">
+      </fieldset>
+      <label>Delay (ms): <input type="number" id="ccr-delay" min="1" step="1" autocomplete="off"></label>
+      <div class="row">
+        <button id="ccr-go" style="flex:1">Start</button>
+        <select id="ccr-dumpsize" title="How many names to check per dump">
+          <option value="10">10</option><option value="25">25</option><option value="50">50</option>
+          <option value="100">100</option><option value="250">250</option><option value="500">500</option>
+          <option value="1000">1000</option>
+        </select>
+        <button id="ccr-dump" class="alt" title="Check this many names at once">Dump</button>
+        <button id="ccr-dumptxt" class="alt" title="Dump, then save the available names to a .txt file">Dump → .txt</button>
+        <button id="ccr-clear" class="alt">Clear</button>
+      </div>
+      <div class="mu" id="ccr-stats"></div>
+      <div class="log" id="ccr-log"></div>
+      <textarea id="ccr-free" readonly placeholder="Available usernames appear here"></textarea>
+      <button id="ccr-copy" class="alt">Copy available</button>
+    </div>
+    <div class="grip" id="ccr-grip" title="Drag to resize"></div>`;
+  document.body.appendChild(box);
+  const $ = id => document.getElementById('ccr-' + id);
+
+  const force = (el, props) => Object.entries(props).forEach(([k, v]) => el.style.setProperty(k, v, 'important'));
+  force($('log'),  { display: 'block', height: '200px', 'min-height': '120px', 'max-height': 'none', flex: '0 0 auto', overflow: 'auto', resize: 'vertical' });
+  force($('free'), { display: 'block', height: '110px', 'min-height': '70px', flex: '0 0 auto', resize: 'vertical' });
+
+  function syncUI() {
+    $('minlen').value = S.minLen; $('maxlen').value = S.maxLen;
+    $('minv').textContent = S.minLen; $('maxv').textContent = S.maxLen;
+    document.querySelectorAll('input[name=ccr-mode]').forEach(r => r.checked = r.value === S.mode);
+    $('letters').checked = S.letters; $('numbers').checked = S.numbers; $('underscore').checked = S.underscore; $('hyphen').checked = S.hyphen;
+    $('urban').checked = S.urban; $('datamuse').checked = S.datamuse; $('oxford').checked = S.oxford;
+    $('oxid').value = S.oxId; $('oxkey').value = S.oxKey; $('delay').value = S.delay;
+    $('dumpsize').value = S.dumpSize;
+  }
+  syncUI();
+
+  $('minlen').oninput = e => {
+    S.minLen = +e.target.value;
+    if (S.minLen > S.maxLen) S.maxLen = S.minLen;
+    syncUI(); resetInc(); save();
+  };
+  $('maxlen').oninput = e => {
+    S.maxLen = +e.target.value;
+    if (S.maxLen < S.minLen) S.minLen = S.maxLen;
+    syncUI(); resetInc(); save();
+  };
+  document.querySelectorAll('input[name=ccr-mode]').forEach(r => r.onchange = () => { S.mode = r.value; resetInc(); save(); });
+  ['letters', 'numbers', 'underscore', 'hyphen', 'urban', 'datamuse', 'oxford'].forEach(k => $(k).onchange = e => { S[k] = e.target.checked; resetInc(); save(); });
+  $('oxid').onchange = e => { S.oxId = e.target.value.trim(); save(); };
+  $('oxkey').onchange = e => { S.oxKey = e.target.value.trim(); save(); };
+  $('delay').onchange = e => { S.delay = Math.max(1, +e.target.value || 1); e.target.value = S.delay; save(); };
+  $('dumpsize').onchange = e => { S.dumpSize = +e.target.value; save(); };
+  $('min').onclick = () => {
+    const collapsed = $('body').style.display === 'none';
+    $('body').style.display = collapsed ? '' : 'none';
+    $('grip').style.display = collapsed ? '' : 'none';
+    box.style.height = collapsed ? S.h + 'px' : 'auto';
+    box.style.minHeight = collapsed ? '' : '0';
+  };
+  $('clear').onclick = () => { $('log').innerHTML = ''; $('free').value = ''; free.length = 0; checked.clear(); stats = { total: 0, free: 0, taken: 0 }; resetInc(); renderStats(); };
+  $('copy').onclick = () => navigator.clipboard.writeText(free.join('\n'));
+
+  // dragging the panel
+  (() => {
+    const h = box.querySelector('.h'); let dx, dy, drag = false;
+    h.onmousedown = e => { if (e.target.id === 'ccr-min') return; drag = true; dx = e.clientX - box.offsetLeft; dy = e.clientY - box.offsetTop; e.preventDefault(); };
+    document.addEventListener('mousemove', e => { if (drag) { box.style.left = (e.clientX - dx) + 'px'; box.style.top = (e.clientY - dy) + 'px'; } });
+    document.addEventListener('mouseup', () => { if (drag) { drag = false; S.x = box.offsetLeft; S.y = box.offsetTop; save(); } });
+  })();
+
+  // resizing the panel height
+  (() => {
+    const g = $('grip'); let sy, sh, rs = false;
+    g.onmousedown = e => { rs = true; sy = e.clientY; sh = box.offsetHeight; e.preventDefault(); };
+    document.addEventListener('mousemove', e => {
+      if (!rs) return;
+      const max = window.innerHeight * 0.95;
+      box.style.height = Math.min(max, Math.max(160, sh + e.clientY - sy)) + 'px';
+    });
+    document.addEventListener('mouseup', () => { if (rs) { rs = false; S.h = box.offsetHeight; save(); } });
+  })();
+
+  function log(msg, cls) {
+    const d = document.createElement('div'); d.className = cls || ''; d.textContent = msg;
+    force(d, { display: 'block', height: 'auto', 'min-height': '16px', flex: '0 0 auto', 'line-height': '16px' });
+    const l = $('log'); l.appendChild(d); l.scrollTop = l.scrollHeight;
+    while (l.children.length > 300) l.removeChild(l.firstChild);
+  }
+  function renderStats() {
+    $('stats').textContent = `Checked: ${stats.total} | Available: ${stats.free} | Taken: ${stats.taken}`;
+  }
+  renderStats();
+
+  /* ---------- name generation ---------- */
+  function charset() {
+    let c = '';
+    if (S.numbers) c += '0123456789';
+    if (S.letters) c += 'abcdefghijklmnopqrstuvwxyz';
+    if (S.underscore) c += '_';
+    if (S.hyphen) c += '-';
+    return c;
+  }
+
+  // builds a random name that follows the rules by construction:
+  // first/last char and any char after a separator are letters or numbers
+  function genRandom(len) {
+    const al = (S.numbers ? '0123456789' : '') + 'abcdefghijklmnopqrstuvwxyz';
+    const sep = (S.underscore ? '_' : '') + (S.hyphen ? '-' : '');
+    const all = al + sep;
+    let n = '';
+    for (let j = 0; j < len; j++) {
+      const edge = j === 0 || j === len - 1 || (j > 0 && sep.includes(n[j - 1]));
+      const p = edge ? al : all;
+      n += p[rnd(p.length)];
+    }
+    return n;
+  }
+
+  function gmGet(url, headers) {
+    return new Promise((res, rej) => GM_xmlhttpRequest({
+      method: 'GET', url, headers: headers || {}, timeout: 10000,
+      onload: r => { try { res(JSON.parse(r.responseText)); } catch (e) { rej(e); } },
+      onerror: rej, ontimeout: () => rej(new Error('timeout'))
+    }));
+  }
+  const clean = w => String(w).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  async function fillPool(len) {
+    const found = [];
+    const tasks = [];
+    if (S.urban) tasks.push(gmGet('https://api.urbandictionary.com/v0/random')
+      .then(j => (j.list || []).forEach(x => found.push(x.word))).catch(() => log('Urban source failed', 'mu')));
+    if (S.datamuse) tasks.push(gmGet('https://api.datamuse.com/words?max=1000&sp=' + encodeURIComponent('?'.repeat(len)))
+      .then(j => j.forEach(x => found.push(x.word))).catch(() => log('Datamuse source failed', 'mu')));
+    if (S.oxford && S.oxId && S.oxKey) {
+      const a = 'abcdefghijklmnopqrstuvwxyz';
+      const prefix = a[rnd(26)] + a[rnd(26)];
+      tasks.push(gmGet(`https://od-api.oxforddictionaries.com/api/v2/search/en-gb?q=${prefix}&prefix=true&limit=1000`,
+        { app_id: S.oxId, app_key: S.oxKey })
+        .then(j => (j.results || []).forEach(x => found.push(x.word || x.id))).catch(() => log('Oxford source failed (check keys)', 'mu')));
+    }
+    await Promise.all(tasks);
+    const pool = pools[len] || (pools[len] = []);
+    found.map(clean).filter(w => w.length === len && /^[a-z0-9]+$/.test(w) && /[a-z]/.test(w))
+      .forEach(w => { if (!checked.has(w) && !pool.includes(w)) pool.push(w); });
+  }
+
+  const randLen = () => S.minLen + rnd(S.maxLen - S.minLen + 1);
+
+  async function nextName() {
+    const cs = charset();
+    if (!S.letters) throw new Error('Letters must be enabled (names need at least 1 letter)');
+
+    if (S.mode === 'random') {
+      for (let i = 0; i < 1000; i++) {
+        const n = genRandom(randLen());
+        if (valid(n) && !checked.has(n)) return n;
+      }
+      return null;
+    }
+
+    if (S.mode === 'increasing') {
+      const base = cs.length;
+      while (incLen <= S.maxLen) {
+        const total = Math.pow(base, incLen);
+        while (counter < total) {
+          let v = counter++, n = '';
+          for (let j = 0; j < incLen; j++) { n = cs[v % base] + n; v = Math.floor(v / base); }
+          if (valid(n)) return n;
+        }
+        incLen++; counter = 0;
+      }
+      return null;
+    }
+
+    // words
+    if (!S.urban && !S.datamuse && !(S.oxford && S.oxId && S.oxKey)) throw new Error('Enable at least one word source');
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const len = randLen();
+      const pool = pools[len] || (pools[len] = []);
+      if (!pool.length) await fillPool(len);
+      if (pool.length) {
+        let w = pool.splice(rnd(pool.length), 1)[0];
+        if (S.numbers && len > 1 && Math.random() < 0.5) {
+          const k = 1 + rnd(Math.min(3, len - 1));
+          let d = ''; for (let i = 0; i < k; i++) d += rnd(10);
+          w = w.slice(0, len - k) + d;
+        }
+        if (valid(w) && !checked.has(w)) return w;
+      }
+    }
+    log(`No words found in range ${S.minLen}-${S.maxLen}`, 'mu');
+    return null;
+  }
+
+  /* ---------- availability check (chess.com public API) ---------- */
+  // 404 = no such profile (available), 200 = profile exists (taken, including closed accounts), 429 = rate limited
+  function apiStatus(name) {
+    return new Promise((res, rej) => GM_xmlhttpRequest({
+      method: 'GET', url: 'https://api.chess.com/pub/player/' + encodeURIComponent(name), timeout: 10000,
+      onload: r => {
+        let status = '';
+        try { status = JSON.parse(r.responseText).status || ''; } catch (e) {}
+        res({ code: r.status, status });
+      },
+      onerror: () => rej(new Error('network error')),
+      ontimeout: () => rej(new Error('timeout'))
+    }));
+  }
+
+  // Used by Dump: native fetch goes out in parallel, whereas GM_xmlhttpRequest can queue requests one after another.
+  // If the page blocks the request (CORS/CSP), that one name falls back to the userscript request.
+  async function burstStatus(name) {
+    try {
+      const ctl = new AbortController();
+      const t = setTimeout(() => ctl.abort(), 8000);
+      const r = await fetch('https://api.chess.com/pub/player/' + encodeURIComponent(name),
+        { signal: ctl.signal, cache: 'no-store', credentials: 'omit' });
+      clearTimeout(t);
+      let status = '';
+      if (r.status === 200) { try { status = (await r.json()).status || ''; } catch (e) {} }
+      return { code: r.status, status };
+    } catch (e) {
+      return apiStatus(name);
+    }
+  }
+
+  async function checkName(name) {
+    for (let tries = 0; tries < 5; tries++) {
+      const r = await apiStatus(name);
+      if (r.code === 429) {
+        log('Rate limited, waiting 10s...', 'mu');
+        await sleep(10000);
+        continue;
+      }
+      if (r.code === 404) return { taken: false };
+      if (r.code === 200) return { taken: true, note: r.status && r.status !== 'basic' ? r.status : '' };
+      throw new Error('Unexpected response ' + r.code);
+    }
+    throw new Error('Still rate limited, try a longer delay');
+  }
+
+  /* ---------- main loop ---------- */
+  async function run() {
+    running = true; $('go').textContent = 'Stop'; $('go').className = 'stop';
+    try {
+      while (running) {
+        const name = await nextName();
+        if (!name) { log('Out of names for these settings', 'mu'); break; }
+        checked.add(name);
+        let res;
+        try { res = await checkName(name); }
+        catch (e) { log(`? ${name} (${e.message})`, 'mu'); await sleep(S.delay); continue; }
+        stats.total++;
+        if (res.taken) { stats.taken++; log(`✘ ${name}${res.note ? ' [' + res.note + ']' : ''}`, 'no'); }
+        else { stats.free++; free.push(name); $('free').value = free.join('\n'); log(`✔ ${name}`, 'ok'); }
+        renderStats();
+        await sleep(S.delay);
+      }
+    } catch (e) {
+      log('Error: ' + e.message, 'no');
+    }
+    running = false; $('go').textContent = 'Start'; $('go').className = '';
+  }
+
+  /* ---------- dump: check a whole batch at once ---------- */
+  function saveTxt(list) {
+    if (!list.length) { log('Nothing available to save', 'mu'); return; }
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    const fname = `chesscom-available-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.txt`;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([list.join('\n') + '\n'], { type: 'text/plain' }));
+    a.download = fname;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    log(`Saved ${list.length} names to ${fname}`, 'ok');
+  }
+
+  async function dump(toTxt) {
+    if (running || dumping) return;
+    dumping = true; $('dump').disabled = true; $('dumptxt').disabled = true;
+    const t0 = performance.now();
+    let pending = [];
+    const found = [];
+    try {
+      const names = [];
+      while (names.length < S.dumpSize) {
+        const n = await nextName();
+        if (!n) break;
+        checked.add(n); names.push(n);
+      }
+      if (!names.length) { log('Out of names for these settings', 'mu'); return; }
+
+      pending = names;
+      for (let round = 0; round < 4 && pending.length; round++) {
+        if (round) {
+          log(`Rate limited on ${pending.length}, retrying in 1s...`, 'mu');
+          await sleep(1000);
+        }
+        const retry = [];
+        const checkOne = async name => {
+          try {
+            const r = await burstStatus(name);
+            if (r.code === 429) { retry.push(name); return; }
+            if (r.code === 404) { stats.total++; stats.free++; free.push(name); found.push(name); log(`✔ ${name}`, 'ok'); }
+            else if (r.code === 200) {
+              stats.total++; stats.taken++;
+              log(`✘ ${name}${r.status && r.status !== 'basic' ? ' [' + r.status + ']' : ''}`, 'no');
+            } else log(`? ${name} (HTTP ${r.code})`, 'mu');
+          } catch (e) { log(`? ${name} (${e.message})`, 'mu'); }
+        };
+        // everything in a wave goes out at once; waves of up to 250 keep the browser from choking on huge dumps
+        for (let i = 0; i < pending.length; i += 250) {
+          await Promise.all(pending.slice(i, i + 250).map(checkOne));
+        }
+        pending = retry;
+      }
+      if (pending.length) {
+        pending.forEach(n => checked.delete(n)); // still rate limited, so they stay eligible for later
+        log(`${pending.length} names skipped (still rate limited)`, 'mu');
+      }
+      $('free').value = free.join('\n');
+      renderStats();
+      log(`Dump: ${names.length - pending.length}/${names.length} checked in ${Math.round(performance.now() - t0)} ms`, 'mu');
+      if (toTxt) saveTxt(found);
+    } catch (e) {
+      log('Error: ' + e.message, 'no');
+    } finally {
+      dumping = false; $('dump').disabled = false; $('dumptxt').disabled = false;
+    }
+  }
+
+  $('go').onclick = () => { if (running) running = false; else if (!dumping) run(); };
+  $('dump').onclick = () => dump(false);
+  $('dumptxt').onclick = () => dump(true);
+})();
