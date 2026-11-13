@@ -1,0 +1,61 @@
+// ==UserScript==
+// @name OpenGuessr Dark Mode
+// @namespace http://tampermonkey.net/
+// @version 1.2
+// @description Press CTRL + M to toggle dark mode on and off, made in 5 mins hope you have fun!
+// @author Europeguy
+// @match *://openguessr.com/*
+// @license Unlicense
+// @grant none
+// @run-at document-start
+// ==/UserScript==
+
+(function() {
+'use strict';
+
+const nightStyle = document.createElement('style');
+nightStyle.id = 'openguessr-night-mode';
+nightStyle.innerHTML = `
+html[data-og-dark="true"] .leaflet-tile-pane, html[data-og-dark="true"] .map-canvas {
+filter: invert(100%) hue-rotate(195deg) brightness(0.8) contrast(1.3) saturate(1.4) !important;
+}
+
+html[data-og-dark="true"] .leaflet-container, html[data-og-dark="true"] #map {
+background-color: #000000 !important;
+}
+
+html[data-og-dark="true"] .leaflet-control-attribution {
+filter: invert(100%) brightness(0.8) !important;
+background-color: rgba(0,0,0,0.5) !important;
+}
+`;
+(document.head || document.documentElement).appendChild(nightStyle);
+
+function setNightMode(enable) {
+if (enable) {
+document.documentElement.setAttribute('data-og-dark', 'true');
+localStorage.setItem('og-dark-mode', 'enabled');
+} else {
+document.documentElement.removeAttribute('data-og-dark');
+localStorage.setItem('og-dark-mode', 'disabled');
+}
+}
+
+let isDarkMode = localStorage.getItem('og-dark-mode') === 'enabled';
+if (isDarkMode) {
+setNightMode(true);
+}
+
+window.addEventListener('keydown', function(e) {
+const targetTag = e.target.tagName ? e.target.tagName.toUpperCase() : '';
+if (targetTag === 'INPUT' || targetTag === 'TEXTAREA' || e.target.isContentEditable) {
+return;
+}
+
+if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'm') {
+e.preventDefault();
+isDarkMode = !isDarkMode;
+setNightMode(isDarkMode);
+}
+});
+})();
