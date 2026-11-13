@@ -1,0 +1,1659 @@
+// ==UserScript==
+// @name         OpenGuessr Stats & Inspector (IDM Edition)
+// @namespace    ogstats.idm
+// @version      1.3.0
+// @description  IDM-style floating inspector for OpenGuessr / WorldGuessr hubs: live Street View & Google stats, cookie manager (copy/edit/delete + explanations), user stats, saved token (bearer) login profiles with one-click login, network/storage capture, raw mode & console. Works on Violentmonkey and Tampermonkey.
+// @author       Dwarf THE PEBBLE Johnson
+// @match        *://*/*
+// @run-at       document-start
+// @noframes
+// @grant        GM_cookie
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_setClipboard
+// @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
+// ==/UserScript==
+
+/* ============================================================================
+ * HOW TO TARGET YOUR HUB (read me)
+ * ----------------------------------------------------------------------------
+ * By default this script matches every page but only ACTIVATES on hosts that
+ * look like an OpenGuessr hub (see CFG.hosts below). Two ways to target it:
+ *
+ *   1) Edit CFG.hosts below and add your hub hostname, e.g. 'myhub.example.com'
+ *   2) Or replace the @match line at the top with your own, e.g.
+ *        // @match  https://myhub.example.com/*
+ *        // @match  http://localhost:3000/*
+ *
+ * There is also a Violentmonkey/Tampermonkey menu command "OG Stats: enable on
+ * this host" which whitelists the current host (saved with GM storage).
+ *
+ * Interface: floating panel like an IDM window.
+ *   - Ctrl+Shift+O .......... toggle the panel
+ *   - Header buttons ........ Basic/Advanced mode, wide/narrow, minimize, close
+ *   - Drag the header ....... move the panel
+ *   - Tokens tab ............ save bearer/secret tokens with a label,
+ *                             then log back in with one click
+ *   - Advanced mode adds .... Network log, Storage, Raw JSON, Console, Help
+ * ==========================================================================*/
+
+(function () {
+  'use strict';
+
+  /* ================================ CONFIG ================================ */
+
+  const CFG = {
+    // Script activates when location.hostname contains any of these:
+    hosts: ['openguessr', 'worldguessr', 'geoguess', 'localhost', '127.0.0.1'],
+    allSites: false, // set true to activate everywhere
+
+    // REST endpoints probed for user stats (first hit wins; ?secret= appended
+    // automatically when a token is found in storage). Edit for your hub.
+    userEndpoints: [
+      '/api/user/getUser',
+      '/api/user',
+      '/api/users/@me',
+      '/api/me',
+      '/api/profile',
+      '/api/eloRank'
+    ],
+
+    netLogLimit: 400,     // network events kept
+    bodyLimit: 65536,     // max response bytes captured per request
+    wsFrameLimit: 2000,   // max characters kept per websocket frame
+    refreshMs: 1000       // live panorama poll rate
+  };
+
+  /* ============================== ENV HELPERS ============================= */
+
+  const W = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+
+  function store(key, val) {
+    try {
+      if (typeof GM_setValue === 'function') {
+        if (arguments.length > 1) { GM_setValue(key, val); return val; }
+        return typeof GM_getValue === 'function' ? GM_getValue(key) : undefined;
+      }
+    } catch (e) { /* fall through */ }
+    const k = 'ogstats.' + key;
+    if (arguments.length > 1) { try { localStorage.setItem(k, JSON.stringify(val)); return val; } catch (e) { return val; } }
+    try { const raw = localStorage.getItem(k); return raw == null ? undefined : JSON.parse(raw); } catch (e) { return undefined; }
+  }
+
+  function copyText(text) {
+    try {
+      if (typeof GM_setClipboard === 'function') { GM_setClipboard(String(text), 'text'); return true; }
+    } catch (e) { /* fall through */ }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = String(text);
+      ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      return true;
+    } catch (e) { return false; }
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function trunc(s, n) {
+    s = String(s == null ? '' : s);
+    return s.length > n ? s.slice(0, n) + '…' : s;
+  }
+
+  // base64url -> text (used by the JWT decoder; page context has atob)
+  function b64UrlDecode(s) {
+    s = String(s).replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
+    while (s.length % 4) s += '=';
+    const bin = atob(s);
+    try { return decodeURIComponent(escape(bin)); } catch (e) { return bin; }
+  }
+
+  // returns {header, payload, sig} for a JWT, or null if not a JWT
+  function decodeJwt(v) {
+    try {
+      const parts = String(v || '').trim().split('.');
+      if (parts.length < 2 || !parts[0] || !parts[1]) return null;
+      const header = JSON.parse(b64UrlDecode(parts[0]));
+      const payload = JSON.parse(b64UrlDecode(parts[1]));
+      if (!header || typeof header !== 'object' || !payload || typeof payload !== 'object') return null;
+      return { header: header, payload: payload, sig: parts.length > 2 ? parts[2] : null };
+    } catch (e) { return null; }
+  }
+
+  function now() {
+    const d = new Date();
+    return d.toTimeString().slice(0, 8) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+  }
+
+  function isTargetSite() {
+    if (CFG.allSites) return true;
+    const saved = store('host.' + location.hostname);
+    if (saved === true) return true;
+    return CFG.hosts.some(h => location.hostname.indexOf(h) !== -1);
+  }
+
+  /* ================================= STATE ================================ */
+
+  const state = {
+    active: false,
+    tab: 'overview',
+    mode: store('mode') || 'basic',      // 'basic' | 'advanced'
+    size: store('size') || 'normal',     // 'normal' | 'wide'
+    minimized: false,
+    visible: store('openOnLoad') !== false,
+    pos: store('pos') || { x: 16, y: 16 },
+    cookies: [],
+    cookiesSource: 'document.cookie',
+    netLog: [],
+    netPaused: false,
+    locations: [],      // captured coordinates
+    panos: [],          // captured panorama ids
+    userSnaps: [],      // user-like objects sniffed from traffic
+    maps: [],
+    livePanos: [],
+    livePanoData: null,
+    userFetches: [],     // [{endpoint, status, data}]
+    tokens: [],
+    googleCookies: [],
+    consoleOut: [],
+    consoleInput: '',
+    jwtInput: '',
+    jwtOut: '',
+    modal: null,         // cookie edit/add modal payload
+    detectedAuth: [],    // tokens detected on this page (refreshed on Tokens tab render)
+    savedTokens: store('savedTokens') || []   // saved login profiles [{id, label, items, savedAt}]
+  };
+
+  /* ============================ NET CAPTURE HOOKS ========================= */
+
+  function addNet(entry) {
+    if (state.netPaused) return;
+    entry.t = now();
+    state.netLog.push(entry);
+    if (state.netLog.length > CFG.netLogLimit) state.netLog.shift();
+    if (panel && state.tab === 'network' && state.mode === 'advanced') softRefreshNet();
+  }
+
+  // -- response body sniffing ------------------------------------------------
+  function sniffBody(url, text) {
+    if (!text) return;
+    // 1) JSON scan
+    if (text[0] === '{' || text[0] === '[') {
+      try {
+        const j = JSON.parse(text);
+        recordFacts(j, url);
+      } catch (e) { /* not valid json */ }
+    }
+    // 2) regex scan for pano ids & coordinates (Google endpoints)
+    let m;
+    const rePano = /[?&](?:panoid|pano)=([A-Za-z0-9_-]{8,})/g;
+    while ((m = rePano.exec(text)) !== null) recordPano(m[1], url);
+    const reLL1 = /!3d(-?\d{1,3}.\d+)!4d(-?\d{1,3}.\d+)/g;
+    while ((m = reLL1.exec(text)) !== null) recordLocation(parseFloat(m[1]), parseFloat(m[2]), url);
+    const reLL2 = /@(-?\d{1,3}.\d+),(-?\d{1,3}.\d+)/g;
+    while ((m = reLL2.exec(text)) !== null) recordLocation(parseFloat(m[1]), parseFloat(m[2]), url);
+  }
+
+  function isGoogleUrl(u) {
+    return /googleapis.com|gstatic.com|google.com|streetview/i.test(u || '');
+  }
+
+  // -- fetch ------------------------------------------------------------------
+  function patchFetch() {
+    if (typeof W.fetch !== 'function') return;
+    const orig = W.fetch;
+    W.fetch = function (input, init) {
+      const url = (typeof input === 'string') ? input : (input && input.url) || '';
+      const method = ((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+      return orig.apply(this, arguments).then(res => {
+        addNet({ kind: 'fetch', method, status: res.status, url, google: isGoogleUrl(url) });
+        try {
+          if (res && typeof res.clone === 'function') {
+            res.clone().text().then(t => {
+              if (t && t.length <= CFG.bodyLimit) sniffBody(url, t);
+            }).catch(() => {});
+          }
+        } catch (e) { /* ignore */ }
+        return res;
+      }, err => {
+        addNet({ kind: 'fetch', method, error: String(err), url, google: isGoogleUrl(url) });
+        throw err;
+      });
+    };
+  }
+
+  // -- XMLHttpRequest --------------------------------------------------------
+  function patchXHR() {
+    if (typeof W.XMLHttpRequest !== 'function') return;
+    const OrigOpen = W.XMLHttpRequest.prototype.open;
+    const OrigSend = W.XMLHttpRequest.prototype.send;
+    W.XMLHttpRequest.prototype.open = function (method, url) {
+      this.__ogstats = { method: String(method || 'GET').toUpperCase(), url: String(url || '') };
+      return OrigOpen.apply(this, arguments);
+    };
+    W.XMLHttpRequest.prototype.send = function (body) {
+      const info = this.__ogstats || {};
+      addNet({ kind: 'xhr', method: info.method, url: info.url, google: isGoogleUrl(info.url) });
+      this.addEventListener('load', () => {
+        const st = this.status;
+        addNet({ kind: 'xhr:done', method: info.method, status: st, url: info.url, google: isGoogleUrl(info.url) });
+        try {
+          const t = this.responseText;
+          if (t && t.length <= CFG.bodyLimit) sniffBody(info.url, t);
+        } catch (e) { /* cross-origin etc. */ }
+      });
+      return OrigSend.apply(this, arguments);
+    };
+  }
+
+  // -- WebSocket (socket.io multiplayer traffic lives here) -------------------
+  function patchWebSocket() {
+    if (typeof W.WebSocket !== 'function') return;
+    const OWS = W.WebSocket;
+    function PatchedWS(url, protos) {
+      const ws = protos === undefined ? new OWS(url) : new OWS(url, protos);
+      try {
+        ws.addEventListener('message', ev => captureFrame('ws-in', String(url), ev.data));
+        const os = ws.send.bind(ws);
+        ws.send = function (d) { captureFrame('ws-out', String(url), d); return os(d); };
+      } catch (e) { /* ignore */ }
+      return ws;
+    }
+    PatchedWS.prototype = OWS.prototype;
+    PatchedWS.OPEN = OWS.OPEN; PatchedWS.CONNECTING = OWS.CONNECTING;
+    PatchedWS.CLOSING = OWS.CLOSING; PatchedWS.CLOSED = OWS.CLOSED;
+    W.WebSocket = PatchedWS;
+  }
+
+  function captureFrame(dir, url, data) {
+    const text = typeof data === 'string' ? data : '[binary]';
+    const cut = text.slice(0, CFG.wsFrameLimit);
+    addNet({ kind: 'ws', dir, url, data: cut, google: isGoogleUrl(url) });
+    sniffBody(url, cut);
+  }
+
+  /* ============================== FACT RECORDING =========================== */
+
+  function recordLocation(lat, lng, src) {
+    const key = lat.toFixed(5) + ',' + lng.toFixed(5);
+    if (state.locations.some(l => l.key === key)) return;
+    state.locations.unshift({ key, lat, lng, src, t: now() });
+    if (state.locations.length > 60) state.locations.pop();
+  }
+
+  function recordPano(id, src) {
+    if (state.panos.some(p => p.id === id)) return;
+    state.panos.unshift({ id, src, t: now() });
+    if (state.panos.length > 60) state.panos.pop();
+  }
+
+  function looksLikeUser(o) {
+    if (!o || typeof o !== 'object') return false;
+    return ('username' in o) || ('name' in o && 'elo' in o) || ('points' in o && 'xp' in o);
+  }
+
+  // recursively scan JSON payloads for locations / pano ids / user objects
+  function recordFacts(node, url, depth) {
+    depth = depth || 0;
+    if (depth > 6 || node == null || typeof node !== 'object') return;
+    if (Array.isArray(node)) { for (let i = 0; i < Math.min(node.length, 60); i++) recordFacts(node[i], url, depth + 1); return; }
+    try {
+      const lat = Number(node.lat != null ? node.lat : (node.latitude != null ? node.latitude : NaN));
+      const lng = Number(node.lng != null ? node.lng : (node.longitude != null ? node.longitude : NaN));
+      if (isFinite(lat) && isFinite(lng)) recordLocation(lat, lng, url);
+      const pid = node.panoId || node.pano || node.panoid;
+      if (typeof pid === 'string' && pid.length >= 8) recordPano(pid, url);
+      if (looksLikeUser(node)) {
+        const sig = JSON.stringify(node).slice(0, 400);
+        if (!state.userSnaps.some(u => u.sig === sig)) {
+          state.userSnaps.unshift({ sig, data: node, src: url, t: now() });
+          if (state.userSnaps.length > 20) state.userSnaps.pop();
+        }
+      }
+      Object.keys(node).forEach(k => recordFacts(node[k], url, depth + 1));
+    } catch (e) { /* circular etc. */ }
+  }
+
+  /* =========================== GOOGLE MAPS TRACKER ========================= */
+
+  let mapsPatched = false;
+  let mapsPollTries = 0;
+
+  function patchGoogleMaps() {
+    const g = W.google && W.google.maps;
+    if (!g || mapsPatched) return !!mapsPatched;
+    mapsPatched = true;
+    try {
+      const OM = g.Map;
+      if (typeof OM === 'function') {
+        function PatchedMap() { const m = new OM(...arguments); state.maps.push(m); return m; }
+        PatchedMap.prototype = OM.prototype;
+        g.Map = PatchedMap;
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      const OP = g.StreetViewPanorama;
+      if (typeof OP === 'function') {
+        function PatchedSVP() { const p = new OP(...arguments); state.livePanos.push(p); return p; }
+        PatchedSVP.prototype = OP.prototype;
+        g.StreetViewPanorama = PatchedSVP;
+      }
+    } catch (e) { /* ignore */ }
+    return true;
+  }
+
+  function readPano(p) {
+    if (!p) return null;
+    const out = {};
+    try { out.pano = p.getPano ? p.getPano() : null; } catch (e) { out.pano = null; }
+    try {
+      const pos = p.getPosition ? p.getPosition() : null;
+      if (pos && typeof pos.lat === 'function') { out.lat = pos.lat(); out.lng = pos.lng(); }
+      else if (pos && typeof pos.lat === 'number') { out.lat = pos.lat; out.lng = pos.lng; }
+    } catch (e) { /* ignore */ }
+    try { const pov = p.getPov ? p.getPov() : null; if (pov) out.pov = pov; } catch (e) { /* ignore */ }
+    try { const ppov = p.getPhotographerPov ? p.getPhotographerPov() : null; if (ppov) out.photographerPov = ppov; } catch (e) { /* ignore */ }
+    try { if (p.getZoom) out.zoom = p.getZoom(); } catch (e) { /* ignore */ }
+    try { const c = p.getCopyright ? p.getCopyright() : null; if (c) out.copyright = c; } catch (e) { /* ignore */ }
+    try {
+      const links = p.getLinks ? p.getLinks() : null;
+      if (links && links.length) out.links = links.slice(0, 8).map(l => ({ pano: l.panoId, heading: l.heading, description: l.description }));
+    } catch (e) { /* ignore */ }
+    return out;
+  }
+
+  function pollPanos() {
+    try {
+      patchGoogleMaps();
+      // panos reachable via map.getStreetView()
+      state.maps.forEach(m => {
+        try {
+          const sv = m.getStreetView && m.getStreetView();
+          if (sv && state.livePanos.indexOf(sv) === -1) state.livePanos.push(sv);
+        } catch (e) { /* ignore */ }
+      });
+      state.livePanos = state.livePanos.filter(p => { try { return !!(p.getPosition || p.getPano); } catch (e) { return false; } });
+      let best = null;
+      state.livePanos.forEach(p => {
+        const d = readPano(p);
+        if (d && (d.pano || isFinite(d.lat))) {
+          if (!best || (d.pano && !best.pano)) best = d;
+        }
+      });
+      state.livePanoData = best;
+      if (best && isFinite(best.lat)) recordLocation(best.lat, best.lng, 'streetview:live');
+      if (best && best.pano) recordPano(best.pano, 'streetview:live');
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ============================== COOKIE MODULE ============================ */
+
+  const COOKIE_INFO = {
+    'SID': 'Google: main account session identifier. Sent to google.com and its services to keep you signed in. Deleting it signs you out of Google.',
+    'HSID': 'Google: secure "host-specific" auth cookie, paired with SID. Required for staying signed in; HttpOnly.',
+    'SSID': 'Google: secure session cookie, paired with HSID. Used for verifying account sessions; HttpOnly.',
+    'APISID': 'Google: API session cookie used by Google APIs (Maps, Street View embeds, etc.). Readable by JavaScript.',
+    'SAPISID': 'Google: signed API session cookie used for authorization on many Google endpoints. Often combined with SAPISIDHASH headers.',
+    'SEID': 'Google: search engine session ID used for extra session security.',
+    '__Secure-1PSID': 'Google: prefixed, Secure-only version of the SID cookie (modern accounts). HttpOnly.',
+    '__Secure-3PSID': 'Google: anti-session-hijacking SID variant bound to a third-party context. HttpOnly.',
+    '__Secure-1PSIDTS': 'Google: SID timestamp/rotation cookie — proves the PSID is fresh and not stolen.',
+    '__Secure-3PSIDTS': 'Google: third-party SID timestamp/rotation cookie.',
+    '__Secure-1PAPISID': 'Google: prefixed SAPISID variant (same purpose, Secure-only transport).',
+    '__Secure-3PAPISID': 'Google: third-party prefixed SAPISID variant.',
+    '__Secure-ENID': 'Google: encrypted ID used in ads/consent flows; expires ~2 years.',
+    'NID': 'Google: "number of days" preferences cookie — remembers device preferences and helps serve search/ads.',
+    'CONSENT': 'Google: stores your GDPR/cookie-consent choices (e.g. YES+ / rollup).',
+    'SOCS': 'Google: stores consent state for cookies themselves ("SOCS" = State of Consent Storage).',
+    '1P_JAR': 'Google: first-party ad cookie jar date — used for ad measurement.',
+    'ANID': 'Google: ad cookie used with 3P cookies in some regions.',
+    'OTZ': 'Google: aggregates visitor behavior across pages for analytics.',
+    'AEC': 'Google: anti-abuse cookie (invisible captcha / reCAPTCHA-related).',
+    'UULE': 'Google: location hint parameter sometimes mirrored into a cookie for localized results.',
+    'connect.sid': 'Express/Express-Session (self-hosted Node hubs): your signed server session. Deleting it logs you out of the hub.',
+    'io': 'Socket.IO handshake cookie: links your WebSocket connection to your HTTP session — how multiplayer rooms recognise you.',
+    'csrftoken': 'Cross-Site Request Forgery token — must accompany state-changing POST requests.',
+    'session': 'Generic server session cookie — identifies your login on this hub.',
+    'token': 'Auth token stored as a cookie (some hubs keep this in localStorage instead — check the Storage tab).',
+    'secret': 'WorldGuessr/OpenGuessr-style user secret (UUID). Full account access for the API — treat like a password.',
+    'PHPSESSID': 'PHP session identifier.',
+    'JSESSIONID': 'Java (e.g. Tomcat) session identifier.',
+    '_ga': 'Google Analytics: identifies a unique visitor (client ID), 2-year lifetime.',
+    '_gid': 'Google Analytics: distinguishes users for 24 hours.',
+    '_gat': 'Google Analytics: throttles request rate (1 minute).'
+  };
+
+  function cookieExplain(name) {
+    if (COOKIE_INFO[name]) return COOKIE_INFO[name];
+    if (/^__Secure-/i.test(name)) return 'A cookie with the __Secure- prefix: only sent over HTTPS and scoped tightly by the site (see RFC 6265bis prefixes).';
+    if (/^__/.test(name)) return 'Double-underscore prefix — an "idle/legacy" cookie that is ignored by browsers but often kept for auditing.';
+    if (/sess|sid/i.test(name)) return 'Looks like a session cookie — identifies your session to the server.';
+    if (/csrf|xsrf/i.test(name)) return 'CSRF/XSRF protection token.';
+    if (/_ga|_gid|_gat|_gcl/i.test(name)) return 'Google Analytics / ads measurement cookie.';
+    if (/jwt/i.test(name)) return 'Appears to contain a JWT (JSON Web Token) — signed login credential.';
+    return 'No known explanation for this cookie name. It is set by this site (or an embedded service).';
+  }
+
+  function gmCookie(op, detail) {
+    return new Promise((resolve, reject) => {
+      if (typeof GM_cookie === 'undefined') return reject(new Error('GM_cookie not available'));
+      try {
+        GM_cookie[op](detail, function (cookies, error) {
+          if (error) return reject(error);
+          resolve(cookies);
+        });
+      } catch (e) { reject(e); }
+    });
+  }
+
+  async function refreshCookies() {
+    let list = [];
+    let source = 'document.cookie';
+    try {
+      const gm = await gmCookie('list', {});
+      if (gm && gm.length) {
+        list = gm.map(c => ({
+          name: c.name, value: c.value, domain: c.domain, path: c.path,
+          secure: !!c.secure, httpOnly: !!c.httpOnly, session: !!c.session,
+          expirationDate: c.expirationDate || null, source: 'GM_cookie'
+        }));
+        source = 'GM_cookie (full access — includes HttpOnly)';
+      }
+    } catch (e) {
+      const doc = parseDocCookies();
+      if (doc.length || !document.cookie) {
+        list = doc;
+      } else {
+        list = doc;
+      }
+    }
+    if (!list.length) list = parseDocCookies();
+    state.cookies = list;
+    state.cookiesSource = source;
+    state.googleCookies = list.filter(c => /(^|.)google(.com)?$|googleapis|gstatic|.google./i.test(c.domain || '') || /^(__Secure|SID|HSID|SSID|APISID|SAPISID|SEID|NID|CONSENT|SOCS|1P_JAR|AEC|OTZ|ANID|UULE)/i.test(c.name));
+    return list;
+  }
+
+  function parseDocCookies() {
+    return String(document.cookie || '').split(';').map(s => s.trim()).filter(Boolean).map(pair => {
+      const i = pair.indexOf('=');
+      const name = i > -1 ? pair.slice(0, i) : pair;
+      const value = i > -1 ? pair.slice(i + 1) : '';
+      return { name: name, value: value, domain: location.hostname, path: '/', source: 'document.cookie' };
+    });
+  }
+
+  function cookieRaw(c) { return c.name + '=' + c.value; }
+
+  async function saveCookie(c) {
+    // Prefer GM_cookie (can also write HttpOnly cookies when the manager allows)
+    try {
+      await gmCookie('set', {
+        name: c.name, value: c.value,
+        domain: c.domain || undefined, path: c.path || '/',
+        secure: c.secure === undefined ? true : !!c.secure,
+        httpOnly: !!c.httpOnly,
+        expirationDate: c.expires ? c.expires : undefined
+      });
+      return { ok: true, via: 'GM_cookie' };
+    } catch (e) { /* fall back to document.cookie */ }
+    let s = c.name + '=' + c.value;
+    s += '; path=' + (c.path || '/');
+    if (c.domain && c.domain !== location.hostname) s += '; domain=' + c.domain;
+    if (c.expires) {
+      const d = (typeof c.expires === 'number') ? new Date(c.expires < 1e12 ? c.expires * 1000 : c.expires) : new Date(c.expires);
+      s += '; expires=' + d.toUTCString();
+    }
+    if (c.secure) s += '; secure';
+    document.cookie = s;
+    return { ok: true, via: 'document.cookie' };
+  }
+
+  async function deleteCookie(c) {
+    try {
+      await gmCookie('delete', { name: c.name, domain: c.domain || undefined, path: c.path || '/' });
+    } catch (e) { /* fall back */ }
+    let s = c.name + '=; path=' + (c.path || '/');
+    if (c.domain) s += '; domain=' + (c.domain || location.hostname);
+    s += '; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+    document.cookie = s;
+    await refreshCookies();
+  }
+
+  /* ============================== USER MODULE ============================== */
+
+  function looksLikeToken(k, v) {
+    if (/token|secret|auth|jwt|bearer|session/i.test(k)) return true;
+    return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(String(v || ''));
+  }
+
+  function scanTokens() {
+    const out = [];
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        const v = localStorage.getItem(k);
+        if (looksLikeToken(k, v)) out.push({ where: 'localStorage', key: k, value: v });
+      }
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const k = sessionStorage.key(i);
+        const v = sessionStorage.getItem(k);
+        if (looksLikeToken(k, v)) out.push({ where: 'sessionStorage', key: k, value: v });
+      }
+    } catch (e) { /* ignore */ }
+    state.tokens = out;
+    return out;
+  }
+
+  async function fetchUserStats() {
+    scanTokens();
+    const token = (state.tokens.find(t => /secret|token/i.test(t.key)) || {}).value;
+    state.userFetches = [];
+    for (const ep of CFG.userEndpoints) {
+      let url = ep;
+      if (token && url.indexOf('?') === -1) url += '?secret=' + encodeURIComponent(token);
+      try {
+        const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+        const r = await fetch(url, { credentials: 'include', headers: headers });
+        let data = null;
+        try { data = await r.json(); } catch (e) { data = null; }
+        state.userFetches.push({ endpoint: ep, status: r.status, data });
+        if (r.ok && data && typeof data === 'object') recordFacts(data, url);
+      } catch (e) {
+        state.userFetches.push({ endpoint: ep, status: 0, error: String(e) });
+      }
+    }
+  }
+
+  /* ============================ TOKEN LOGIN MODULE ========================= */
+
+  function uid() {
+    return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  // Collect everything on this page that can log you back in:
+  // storage secrets/tokens, JWT bearers and session-ish cookies.
+  function detectAuthItems() {
+    const items = [];
+    const seen = new Set();
+    const push = (where, key, value) => {
+      if (key == null || value == null) return;
+      const id = where + '|' + key;
+      if (seen.has(id)) return;
+      seen.add(id);
+      items.push({ where: where, key: key, value: String(value) });
+    };
+    scanTokens().forEach(t => push(t.where, t.key, t.value));
+    findBearer().forEach(j => push(j.store, j.key, j.value));
+    (state.cookies || []).forEach(c => {
+      if (/sess|sid|token|secret|auth|jwt/i.test(c.name)) push('cookie', c.name, c.value);
+    });
+    return items;
+  }
+
+  function saveTokenProfile(label, items) {
+    if (!items || !items.length) return;
+    state.savedTokens.unshift({
+      id: uid(),
+      label: (label || '').trim() || 'Untitled token',
+      items: items,
+      savedAt: new Date().toISOString()
+    });
+    store('savedTokens', state.savedTokens);
+  }
+
+  // One-click login: write the saved items back into storage/cookies, remove
+  // competing token keys from storage, then reload the page.
+  async function loginWithProfile(p) {
+    if (!p || !p.items || !p.items.length) return;
+    const keep = new Set(p.items.map(it => it.where + '|' + it.key));
+    // clean out token-like storage keys that are not part of this profile
+    // (makes account switching reliable; cookies are left untouched)
+    (state.detectedAuth && state.detectedAuth.length ? state.detectedAuth : detectAuthItems()).forEach(it => {
+      if (it.where === 'cookie' || keep.has(it.where + '|' + it.key)) return;
+      try {
+        if (it.where === 'localStorage') localStorage.removeItem(it.key);
+        else if (it.where === 'sessionStorage') sessionStorage.removeItem(it.key);
+      } catch (e) { /* ignore */ }
+    });
+    for (const it of p.items) {
+      try {
+        if (it.where === 'cookie') {
+          await saveCookie({ name: it.key, value: it.value, path: '/', secure: location.protocol === 'https:' });
+        } else if (it.where === 'sessionStorage') {
+          sessionStorage.setItem(it.key, it.value);
+        } else {
+          localStorage.setItem(it.key, it.value);
+        }
+      } catch (e) { /* ignore */ }
+    }
+    location.reload();
+  }
+
+  /* ============================== SNAPSHOT ================================ */
+
+  function snapshot() {
+    scanTokens();
+    const dump = (store2) => {
+      const o = {};
+      try { for (let i = 0; i < store2.length; i++) o[store2.key(i)] = store2.getItem(store2.key(i)); } catch (e) { /* ignore */ }
+      return o;
+    };
+    return {
+      meta: {
+        script: 'OpenGuessr Stats & Inspector (IDM Edition) v1.3.0',
+        href: location.href,
+        host: location.hostname,
+        userAgent: navigator.userAgent,
+        capturedAt: new Date().toISOString(),
+        guiMode: state.mode
+      },
+      streetViewLive: state.livePanoData,
+      capturedLocations: state.locations,
+      capturedPanoIds: state.panos,
+      user: {
+        tokensFound: state.tokens,
+        endpointProbes: state.userFetches,
+        trafficSnapshots: state.userSnaps.map(s => s.data),
+        savedLoginTokens: state.savedTokens
+      },
+      cookies: { source: state.cookiesSource, all: state.cookies },
+      googleCookies: state.googleCookies,
+      localStorage: dump(localStorage),
+      sessionStorage: dump(sessionStorage),
+      networkLog: state.netLog.slice(-100)
+    };
+  }
+
+  /* ================================== UI ================================== */
+
+  let host = null, shadow = null, panel = null, netTimer = null;
+
+  const CSS = `
+    :host { all: initial; }
+    * { box-sizing: border-box; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+    .panel {
+      position: fixed; z-index: 2147483000;
+      left: 0; top: 0;
+      width: 470px; max-width: 96vw; max-height: 78vh;
+      background: #0f1216; color: #dbe2ea;
+      border: 1px solid #2b333d; border-radius: 10px;
+      box-shadow: 0 12px 40px rgba(0,0,0,.55);
+      display: flex; flex-direction: column; overflow: hidden;
+      font-size: 12px;
+    }
+    .panel.wide { width: 700px; }
+    .panel.basic { border-color: #2f5f43; }
+    .hdr {
+      display: flex; align-items: center; gap: 6px;
+      padding: 8px 10px; cursor: move; user-select: none;
+      background: linear-gradient(180deg,#1a2029,#141920);
+      border-bottom: 1px solid #2b333d;
+    }
+    .logo { width: 14px; height: 14px; border-radius: 4px;
+      background: conic-gradient(from 180deg, #4caf50, #2196f3, #4caf50); flex: 0 0 auto; }
+    .title { font-weight: 700; font-size: 12.5px; letter-spacing: .4px; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .mode { font-size: 10px; padding: 2px 7px; border-radius: 99px; background:#22303d; color:#8fd3ff; border:1px solid #2b4a5e; cursor:pointer; }
+    .mode.adv { background:#2d2438; color:#d3a8ff; border-color:#4b3a63; }
+    .hbtn { background:#1c232c; border:1px solid #2b333d; color:#aab6c2; border-radius:6px;
+      padding: 2px 8px; cursor:pointer; font-size: 11px; }
+    .hbtn:hover { background:#273241; color:#fff; }
+    .tabs { display:flex; gap: 2px; padding: 6px 8px 0; flex-wrap: wrap; background:#12161c; border-bottom:1px solid #232a33; }
+    .tab { padding: 5px 10px; border-radius: 7px 7px 0 0; cursor:pointer; color:#93a1af; font-size:11.5px; border:1px solid transparent; }
+    .tab:hover { color:#dbe2ea; background:#1a212a; }
+    .tab.on { background:#1d2632; color:#fff; border-color:#2b333d; border-bottom-color:#1d2632; }
+    .body { overflow:auto; padding: 10px; flex: 1; scrollbar-width: thin; }
+    .panel.advanced .body { font-family: Consolas, 'Cascadia Mono', Menlo, monospace; font-size: 11.5px; }
+    .card { background:#161c24; border:1px solid #262f3a; border-radius:8px; padding:10px; margin-bottom:10px; }
+    .panel.basic .card { background:#182430; border-color:#2c4256; }
+    .card h3 { margin: 0 0 8px; font-size: 11.5px; text-transform: uppercase; letter-spacing:.8px; color:#8fd3ff; }
+    .panel.basic .card h3 { color:#7fd9a0; font-size: 12.5px; }
+    .row { display:flex; align-items:flex-start; gap:8px; padding:3px 0; }
+    .k { color:#8b98a5; min-width: 118px; }
+    .v { color:#e6edf3; word-break: break-all; flex:1; }
+    .panel.basic .k { min-width: 130px; color:#a7b6c2; }
+    .btn { background:#20303f; color:#bfe3ff; border:1px solid #31485c; border-radius:5px;
+      padding: 2px 8px; cursor:pointer; font-size: 10.5px; margin: 1px; white-space: nowrap; }
+    .btn:hover { background:#2a4256; }
+    .btn.warn { background:#3a2430; color:#ffb3c1; border-color:#5c3a4a; }
+    .btn.go { background:#1f3a2c; color:#9ff0bd; border-color:#2f5c45; }
+    .chip { display:inline-block; background:#233042; color:#9fc6ff; border-radius: 4px;
+      padding: 0 5px; font-size: 10px; margin-right: 4px; }
+    .chip.hot { background:#402a2a; color:#ffb0b0; }
+    .chip.ok { background:#20402c; color:#9ff0bd; }
+    .cookie { border-bottom: 1px solid #212933; padding: 7px 2px; }
+    .cookie:last-child { border-bottom: none; }
+    .ck-name { font-weight: 700; color:#e6edf3; word-break: break-all; }
+    .ck-val { color:#9fb2c4; word-break: break-all; margin: 3px 0; }
+    .ck-exp { color:#7d8b98; font-size: 10.5px; margin: 4px 0 6px; line-height: 1.5; }
+    .netrow { border-bottom:1px solid #1d242d; padding: 5px 4px; cursor: pointer; }
+    .netrow:hover { background:#171e26; }
+    .nettime { color:#68727d; margin-right: 6px; }
+    .netmethod { color:#9ff0bd; margin-right: 6px; }
+    .neturl { color:#b8c4d0; word-break: break-all; }
+    .netdata { display:none; white-space: pre-wrap; color:#93a1af; padding: 6px 4px 2px;
+      word-break: break-all; background:#10151b; border-radius: 4px; margin: 4px 0; max-height: 200px; overflow: auto; }
+    .netrow.open .netdata { display:block; }
+    .pill { position: fixed; z-index: 2147483000; left: 16px; bottom: 16px; background:#10161d; color:#8fd3ff;
+      border:1px solid #2b4a5e; padding: 8px 14px; border-radius: 99px; cursor: pointer; font-size: 12px;
+      box-shadow: 0 6px 24px rgba(0,0,0,.5); }
+    .pill:hover { background:#182230; }
+    pre.raw { background:#10151b; border:1px solid #212933; border-radius:6px; padding:10px;
+      white-space: pre-wrap; word-break: break-all; color:#c7d3df; max-height: 44vh; overflow:auto; margin: 0 0 8px; }
+    .console-in { width: 100%; background:#10151b; border:1px solid #2b333d; color:#dbe2ea;
+      border-radius: 6px; padding: 7px 9px; font-family: inherit; font-size: 11.5px; margin-bottom: 6px; }
+    .modal-wrap { position: fixed; inset: 0; background: rgba(5,8,12,.55); display:flex;
+      align-items: center; justify-content: center; z-index: 2147483001; }
+    .modal { background:#141a21; border:1px solid #2f3a47; border-radius: 10px; padding: 16px;
+      width: 400px; max-width: 92vw; color:#dbe2ea; font-size: 12px; }
+    .modal h3 { margin: 0 0 12px; font-size: 13px; }
+    .modal label { display:block; margin: 8px 0 3px; color:#8b98a5; }
+    .modal input { width: 100%; background:#0e1319; color:#dbe2ea; border:1px solid #2b333d;
+      border-radius: 6px; padding: 6px 8px; font-family: inherit; font-size: 12px; }
+    .modal .foot { display:flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+    .note { color:#8b98a5; line-height: 1.55; }
+    .big { font-size: 13.5px; }
+    .empty { color:#68727d; font-style: italic; padding: 6px 2px; }
+  `;
+
+  const TABS_BASIC = [
+    ['overview', 'Overview'], ['location', 'Location'], ['user', 'User'], ['tokens', 'Tokens'], ['cookies', 'Cookies']
+  ];
+  const TABS_ADV = [
+    ['overview', 'Overview'], ['google', 'Google / SV'], ['cookies', 'Cookies'],
+    ['user', 'User'], ['tokens', 'Tokens'], ['network', 'Network'], ['storage', 'Storage'],
+    ['raw', 'Raw'], ['console', 'Console'], ['help', 'Help']
+  ];
+
+  function tabList() { return state.mode === 'advanced' ? TABS_ADV : TABS_BASIC; }
+
+  // ---------- tab renderers ----------
+
+  function renderOverview() {
+    const counts = [
+      ['Cookies visible', state.cookies.length],
+      ['Google cookies', state.googleCookies.length],
+      ['Locations captured', state.locations.length],
+      ['Pano IDs captured', state.panos.length],
+      ['Net events', state.netLog.length],
+      ['User snapshots', state.userSnaps.length]
+    ].map(([k, v]) => '<div class="row"><div class="k">' + k + '</div><div class="v"><span class="chip ok">' + v + '</span></div></div>').join('');
+    const lp = state.livePanoData;
+    const quickPano = lp ? (lp.pano || '—') : '<span class="empty">no live panorama yet — start a round</span>';
+    const firstUser = state.userSnaps[0] ? (state.userSnaps[0].data.username || state.userSnaps[0].data.name || '—') : null;
+    const firstSnap = state.userFetches.find(u => u.status === 200);
+    const userName = firstUser || (firstSnap && (firstSnap.data && (firstSnap.data.username || firstSnap.data.name))) || '<span class="empty">not detected yet</span>';
+    return `
+      <div class="card">
+        <h3>Page</h3>
+        <div class="row"><div class="k">URL</div><div class="v">${esc(trunc(location.href, 160))}</div></div>
+        <div class="row"><div class="k">Host</div><div class="v">${esc(location.hostname)}</div></div>
+        <div class="row"><div class="k">GUI mode</div><div class="v">${state.mode === 'advanced' ? 'Advanced (raw)' : 'Basic'}</div></div>
+        <div class="row"><div class="k">Hotkey</div><div class="v">Ctrl+Shift+O toggles this panel</div></div>
+      </div>
+      <div class="card">
+        <h3>Capture counters</h3>
+        ${counts}
+      </div>
+      <div class="card">
+        <h3>Quick glance</h3>
+        <div class="row"><div class="k">Live pano</div><div class="v">${esc(quickPano)}</div></div>
+        <div class="row"><div class="k">User</div><div class="v">${esc(userName)}</div></div>
+        <div class="row"><div class="k">Saved tokens</div><div class="v">${state.savedTokens.length}</div></div>
+        <div style="margin-top:8px">
+          <span class="btn go" data-action="snapshot-copy">Copy full snapshot JSON</span>
+          <span class="btn" data-action="refresh">Refresh now</span>
+        </div>
+      </div>`;
+  }
+
+  function panoCard(lp) {
+    if (!lp) return '<div class="empty">No live Street View panorama detected. Start a round, or check the Google / SV tab in Advanced mode.</div>';
+    const rows = [
+      ['Pano ID', lp.pano || '—'],
+      ['Latitude', isFinite(lp.lat) ? lp.lat : '—'],
+      ['Longitude', isFinite(lp.lng) ? lp.lng : '—'],
+      ['Heading', lp.pov ? (lp.pov.heading + '°') : '—'],
+      ['Pitch', lp.pov ? (lp.pov.pitch + '°') : '—'],
+      ['Zoom', lp.zoom != null ? lp.zoom : '—'],
+      ['Photographer POV', lp.photographerPov ? (lp.photographerPov.heading + '° / ' + lp.photographerPov.pitch + '°') : '—'],
+      ['Copyright', lp.copyright || '—'],
+      ['Links', lp.links ? lp.links.length + ' neighboring panos' : '—']
+    ].map(([k, v]) => '<div class="row"><div class="k">' + k + '</div><div class="v">' + esc(v) + '</div></div>').join('');
+    const coord = isFinite(lp.lat) ? lp.lat + ',' + lp.lng : '';
+    return '<div class="card"><h3>Live Street View</h3>' + rows +
+      '<div style="margin-top:8px">' +
+      (coord ? '<span class="btn" data-action="copy" data-copy="' + esc(coord) + '">Copy coords</span>' : '') +
+      (lp.pano ? '<span class="btn" data-action="copy" data-copy="' + esc(lp.pano) + '">Copy pano ID</span>' : '') +
+      '<span class="btn" data-action="gmaps">Open in Google Maps</span>' +
+      '</div></div>';
+  }
+
+  function renderLocation() {
+    const locs = state.locations.slice(0, 15).map(l =>
+      '<div class="row"><div class="k">' + esc(l.t) + '</div><div class="v">' + esc(l.lat.toFixed(5)) + ', ' + esc(l.lng.toFixed(5)) +
+      ' <span class="btn" data-action="copy" data-copy="' + esc(l.lat + ',' + l.lng) + '">copy</span></div></div>').join('');
+    return panoCard(state.livePanoData) +
+      '<div class="card"><h3>Captured locations (last 15)</h3>' + (locs || '<div class="empty">Nothing captured yet. Locations appear when the game sends or loads coordinates.</div>') + '</div>';
+  }
+
+  function renderGoogle() {
+    const lp = state.livePanoData;
+    const panos = state.panos.slice(0, 20).map(p =>
+      '<div class="row"><div class="k">' + esc(p.t) + '</div><div class="v">' + esc(p.id) +
+      ' <span class="chip">' + esc(trunc(p.src, 34)) + '</span> <span class="btn" data-action="copy" data-copy="' + esc(p.id) + '">copy</span></div></div>').join('');
+    const gc = state.googleCookies.map((c, i) =>
+      '<div class="row"><div class="k">' + esc(c.name) + '</div><div class="v">' + esc(trunc(c.value, 40)) + '</div></div>').join('');
+    const gnet = state.netLog.filter(n => n.google).slice(-12).reverse().map(n =>
+      '<div class="row"><div class="k">' + esc(n.t) + '</div><div class="v">' + esc(trunc(n.url, 90)) + '</div></div>').join('');
+    return panoCard(lp) +
+      '<div class="card"><h3>Pano IDs seen on the wire</h3>' + (panos || '<div class="empty">No pano IDs captured yet.</div>') + '</div>' +
+      '<div class="card"><h3>Google cookies in this context</h3>' + (gc || '<div class="empty">No Google cookies visible (they may be HttpOnly on another domain — check the Cookies tab source note).</div>') + '</div>' +
+      '<div class="card"><h3>Recent Google network calls</h3>' + (gnet || '<div class="empty">None captured.</div>') + '</div>' +
+      '<div class="card"><h3>Tracked Google objects</h3>' +
+      '<div class="row"><div class="k">google.maps</div><div class="v">' + (W.google && W.google.maps ? 'loaded' : 'not loaded') + '</div></div>' +
+      '<div class="row"><div class="k">Map instances</div><div class="v">' + state.maps.length + '</div></div>' +
+      '<div class="row"><div class="k">Panorama instances</div><div class="v">' + state.livePanos.length + '</div></div></div>';
+  }
+
+  function renderCookies() {
+    const rows = state.cookies.map((c, i) => {
+      const flags = [
+        c.httpOnly ? '<span class="chip hot">HttpOnly</span>' : '',
+        c.secure ? '<span class="chip ok">Secure</span>' : '',
+        c.session ? '<span class="chip">session</span>' : ''
+      ].join('');
+      const exp = c.expirationDate
+        ? 'expires ' + new Date(c.expirationDate * 1000).toLocaleString()
+        : (c.session ? 'session cookie (dies with the browser)' : 'unknown expiry (document.cookie view)');
+      return `<div class="cookie">
+        <div class="ck-name">${esc(c.name)} ${flags}</div>
+        <div class="ck-exp">${esc(exp)} · domain: ${esc(c.domain || '?')} · path: ${esc(c.path || '?')}</div>
+        <div class="ck-val">${esc(trunc(c.value, 160))}</div>
+        <div class="ck-exp">${esc(cookieExplain(c.name))}</div>
+        <div>
+          <span class="btn" data-action="ck-copy-val" data-i="${i}">Copy value</span>
+          <span class="btn" data-action="ck-copy-raw" data-i="${i}">Copy name=value</span>
+          <span class="btn" data-action="ck-copy-json" data-i="${i}">Copy JSON</span>
+          <span class="btn go" data-action="ck-edit" data-i="${i}">Edit</span>
+          <span class="btn warn" data-action="ck-del" data-i="${i}">Delete</span>
+        </div>
+      </div>`;
+    }).join('');
+    return `
+      <div class="card">
+        <h3>Cookies (${state.cookies.length})</h3>
+        <div class="note">Source: <b>${esc(state.cookiesSource)}</b>. ${
+          state.cookiesSource.indexOf('document.cookie') !== -1
+            ? 'HttpOnly cookies are hidden in this view. Grant the GM_cookie permission in your userscript manager (or use Violentmonkey ≥ 2.15 / Tampermonkey with cookie access enabled) to see and edit them.'
+            : 'Full cookie access via GM_cookie — HttpOnly cookies included.'}</div>
+        <div style="margin-top:8px">
+          <span class="btn go" data-action="ck-add">＋ Add cookie</span>
+          <span class="btn" data-action="refresh">Refresh list</span>
+          <span class="btn" data-action="ck-copy-all">Copy all (JSON)</span>
+          <span class="btn" data-action="ck-export">Export all</span>
+        </div>
+      </div>
+      ${rows || '<div class="empty">No cookies readable on this page.</div>'}`;
+  }
+
+  // find JWT-shaped values in storage regardless of key name (e.g. 'bearer')
+  function findBearer() {
+    const found = [];
+    const scan = (storeName, storeObj) => {
+      try {
+        for (let i = 0; i < storeObj.length; i++) {
+          const k = storeObj.key(i), v = storeObj.getItem(k);
+          if (v && String(v).indexOf('.') !== -1 && decodeJwt(v)) found.push({ store: storeName, key: k, value: v });
+        }
+      } catch (e) { /* ignore */ }
+    };
+    scan('localStorage', localStorage);
+    scan('sessionStorage', sessionStorage);
+    return found;
+  }
+
+  function renderBearerCard() {
+    const jwts = findBearer();
+    if (!jwts.length) return '<div class="card"><h3>Bearer / JWT token</h3><div class="empty">No JWT found in local/session storage (e.g. no "bearer" key on this hub).</div></div>';
+    return jwts.slice(0, 3).map(j => {
+      const d = decodeJwt(j.value) || { header: {}, payload: {} };
+      const exp = d.payload.exp ? d.payload.exp * 1000 : null;
+      return '<div class="card"><h3>Bearer / JWT · ' + esc(j.store) + '.' + esc(j.key) + '</h3>' +
+        '<div class="ck-val">' + esc(trunc(j.value, 100)) + '</div>' +
+        '<div class="ck-exp">header: ' + esc(JSON.stringify(d.header)) + '<br>payload: ' + esc(JSON.stringify(d.payload)) + '</div>' +
+        (exp != null
+          ? '<div class="ck-exp">expires: ' + esc(new Date(exp).toLocaleString()) + ' <span class="chip ' + (exp > Date.now() ? 'ok' : 'hot') + '">' + (exp > Date.now() ? 'valid' : 'EXPIRED') + '</span></div>'
+          : '') +
+        '<div class="ck-exp">Signed with the server key: you can view, copy or replace this token, but editing its payload invalidates it.</div>' +
+        '<span class="btn" data-action="copy" data-copy="' + esc(j.value) + '">Copy token</span>' +
+        '<span class="btn" data-action="copy" data-copy="' + esc(JSON.stringify(d.payload, null, 2)) + '">Copy decoded payload</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  function renderUser() {
+    const tok = state.tokens.map(t =>
+      '<div class="row"><div class="k">' + esc(t.where) + '.' + esc(t.key) + '</div><div class="v">' + esc(trunc(t.value, 46)) +
+      ' <span class="btn" data-action="copy" data-copy="' + esc(t.value) + '">copy</span></div></div>').join('');
+    const probes = state.userFetches.map(f => {
+      const ok = f.status >= 200 && f.status < 300;
+      const body = f.data ? JSON.stringify(f.data, null, 2) : (f.error ? String(f.error) : '—');
+      return '<div class="card"><h3>' + esc(f.endpoint) + ' <span class="chip ' + (ok ? 'ok' : 'hot') + '">' + f.status + '</span></h3>' +
+        '<pre class="raw">' + esc(trunc(body, 2200)) + '</pre>' +
+        '<span class="btn" data-action="copy" data-copy="' + esc(body) + '">Copy JSON</span></div>';
+    }).join('');
+    const snaps = state.userSnaps.slice(0, 5).map((s, i) =>
+      '<div class="card"><h3>Traffic user snapshot ' + (i + 1) + ' · ' + esc(s.t) + '</h3>' +
+      '<pre class="raw">' + esc(trunc(JSON.stringify(s.data, null, 2), 1500)) + '</pre>' +
+      '<span class="btn" data-action="copy" data-copy="' + esc(JSON.stringify(s.data)) + '">Copy</span></div>').join('');
+    return `
+      <div class="card">
+        <h3>Auth tokens & secrets found in storage</h3>
+        ${tok || '<div class="empty">No token-like keys found in local/session storage.</div>'}
+        <div class="note" style="margin-top:6px">WorldGuessr/OpenGuessr-style hubs keep a UUID "secret" that is a full account credential — never share it. Save it with a label in the <b>Tokens</b> tab for one-click login.</div>
+      </div>
+      ${renderBearerCard()}
+      <div class="card">
+        <h3>API probes</h3>
+        <div class="note">Endpoints tried: ${CFG.userEndpoints.map(esc).join(', ')}</div>
+        <div style="margin-top:8px"><span class="btn go" data-action="user-fetch">Probe user endpoints now</span></div>
+      </div>
+      ${probes}
+      ${snaps}`;
+  }
+
+  function renderTokens() {
+    state.detectedAuth = detectAuthItems();
+    const det = state.detectedAuth.map((it, idx) => {
+      const d = decodeJwt(it.value);
+      let chip = '';
+      if (d && d.payload && d.payload.exp) {
+        const valid = d.payload.exp * 1000 > Date.now();
+        chip = ' <span class="chip ' + (valid ? 'ok' : 'hot') + '">' + (valid ? 'valid JWT' : 'EXPIRED JWT') + '</span>';
+      }
+      return '<div class="row"><div class="k">' + esc(trunc(it.where + '.' + it.key, 32)) + '</div><div class="v">' +
+        esc(trunc(it.value, 44)) + chip +
+        ' <span class="btn go" data-action="tok-save-one" data-i="' + idx + '">Save + label</span></div></div>';
+    }).join('');
+    const saved = state.savedTokens.map((p, idx) => {
+      const items = p.items.map(it =>
+        '<div class="ck-exp">' + esc(it.where) + '.' + esc(it.key) + ' = ' + esc(trunc(it.value, 70)) + '</div>').join('');
+      let expChip = '';
+      const exps = p.items.map(it => {
+        const d = decodeJwt(it.value);
+        return (d && d.payload && d.payload.exp) ? d.payload.exp * 1000 : 0;
+      }).filter(Boolean);
+      if (exps.length) {
+        const valid = Math.min.apply(null, exps) > Date.now();
+        expChip = ' <span class="chip ' + (valid ? 'ok' : 'hot') + '">' + (valid ? 'valid' : 'EXPIRED') + '</span>';
+      }
+      return '<div class="cookie">' +
+        '<div class="ck-name">' + esc(p.label) + expChip + '</div>' +
+        '<div class="ck-exp">saved ' + esc(p.savedAt) + ' · ' + p.items.length + ' item(s)</div>' +
+        items +
+        '<div>' +
+        '<span class="btn go" data-action="tok-login" data-i="' + idx + '">⚡ Log in with this token</span>' +
+        '<span class="btn" data-action="tok-copy" data-i="' + idx + '">Copy JSON</span>' +
+        '<span class="btn warn" data-action="tok-del" data-i="' + idx + '">Delete</span>' +
+        '</div></div>';
+    }).join('');
+    return `
+      <div class="card">
+        <h3>Saved tokens — one-click login</h3>
+        <div class="note">Pick a saved token and it is written back into storage/cookies, competing storage token keys are removed, and the page reloads — logging you in as that account. Cookies are never removed automatically.</div>
+        <div style="margin-top:8px">
+          <span class="btn go" data-action="tok-save-session">＋ Save current session as profile</span>
+        </div>
+      </div>
+      ${saved || '<div class="empty">No saved tokens yet. Save one from the list below (single token) or save your whole current session as a profile.</div>'}
+      <div class="card">
+        <h3>Detected tokens on this page</h3>
+        ${det || '<div class="empty">No tokens detected — sign in on the hub first, or press Refresh in Overview.</div>'}
+        <div class="note" style="margin-top:6px">Detected automatically: storage secrets/bearer JWTs and session cookies. "Save + label" stores a single item; the profile button stores all of them together under one label.</div>
+      </div>`;
+  }
+
+  function renderNetwork() {
+    const rows = state.netLog.slice().reverse().map((n, i) => {
+      const label = n.kind === 'ws' ? (n.dir === 'ws-out' ? 'WS→' : 'WS←') : (n.method || n.kind);
+      const status = n.status != null ? ' <span class="chip ' + (n.status < 400 ? 'ok' : 'hot') + '">' + n.status + '</span>' : (n.error ? ' <span class="chip hot">ERR</span>' : '');
+      const data = n.data ? esc(trunc(n.data, 800)) : '';
+      return `<div class="netrow" data-action="net-toggle" data-i="${i}">
+        <span class="nettime">${esc(n.t)}</span><span class="netmethod">${esc(label)}</span>${n.google ? '<span class="chip">G</span>' : ''}${status}
+        <div class="neturl">${esc(trunc(n.url || '', 130))}</div>
+        ${data ? '<div class="netdata">' + data + '</div>' : ''}
+      </div>`;
+    }).join('');
+    return `
+      <div class="card">
+        <h3>Network capture (${state.netLog.length})</h3>
+        <div class="note">fetch · XHR · WebSocket frames. Click a row to expand its payload. Google calls are tagged <span class="chip">G</span>.</div>
+        <div style="margin-top:8px">
+          <span class="btn" data-action="net-pause">${state.netPaused ? '▶ Resume capture' : '⏸ Pause capture'}</span>
+          <span class="btn warn" data-action="net-clear">Clear log</span>
+          <span class="btn" data-action="net-copy">Copy log JSON</span>
+        </div>
+      </div>
+      ${rows || '<div class="empty">No traffic captured yet (this tab appears in Advanced mode).</div>'}`;
+  }
+
+  function renderStorage() {
+    const looksLikeJwt = v =>
+      typeof v === 'string' && v.indexOf('.') !== -1 &&
+      /^[A-Za-z0-9_-]+.[A-Za-z0-9_-]+.[A-Za-z0-9_-]*$/.test(v);
+    const dump = (name, storeName, storeObj) => {
+      let n = 0;
+      try { n = storeObj.length; } catch (e) { n = 0; }
+      let rows = '';
+      try {
+        for (let i = 0; i < n; i++) {
+          const k = storeObj.key(i), v = storeObj.getItem(k);
+          let extra = '';
+          if (looksLikeJwt(v)) {
+            const d = decodeJwt(v);
+            if (d) {
+              const exp = d.payload && d.payload.exp
+                ? '<br>expires: ' + esc(new Date(d.payload.exp * 1000).toLocaleString()) : '';
+              extra = '<div class="ck-exp" style="color:#9fd6ff">' +
+                'JWT header: ' + esc(JSON.stringify(d.header)) + '<br>' +
+                'JWT payload: ' + esc(JSON.stringify(d.payload)) + exp + '</div>';
+            }
+          }
+          rows += '<div class="row"><div class="k">' + esc(trunc(k, 40)) + '</div><div class="v">' + esc(trunc(v, 120)) +
+            ' <span class="btn" data-action="copy" data-copy="' + esc(v) + '">copy</span>' +
+            '<span class="btn go" data-action="st-edit" data-store="' + storeName + '" data-key="' + esc(k) + '">edit</span>' +
+            '<span class="btn warn" data-action="st-del" data-store="' + storeName + '" data-key="' + esc(k) + '">del</span></div>' +
+            extra + '</div>';
+        }
+      } catch (e) { rows = '<div class="empty">Storage unreadable.</div>'; }
+      return '<div class="card"><h3>' + name + ' (' + n + ')</h3>' + (rows || '<div class="empty">Empty.</div>') + '</div>';
+    };
+    return '<div class="card"><h3>Storage editor</h3>' +
+      '<div class="note">Values are editable in place; JWTs are decoded under their row. Caveat: signed tokens (like a <b>bearer</b> JWT) can be edited freely in storage, but the server only accepts ones whose signature matches — so you can swap in another <i>valid</i> token or delete this one, but changing the payload (userId, exp…) makes it invalid.</div></div>' +
+      dump('localStorage', 'local', localStorage) + dump('sessionStorage', 'session', sessionStorage);
+  }
+
+  function renderRaw() {
+    const json = JSON.stringify(snapshot(), null, 2);
+    return `
+      <div style="margin-bottom:8px">
+        <span class="btn go" data-action="snapshot-copy">Copy snapshot JSON</span>
+        <span class="btn" data-action="snapshot-download">Download .json</span>
+        <span class="btn" data-action="refresh">Rebuild</span>
+      </div>
+      <pre class="raw">${esc(trunc(json, 60000))}</pre>`;
+  }
+
+  function renderConsole() {
+    const out = state.consoleOut.slice(-40).map(l => esc(l)).join('\n');
+    let jwtBlock = '';
+    if (state.jwtOut) {
+      jwtBlock = '<pre class="raw" style="margin-top:8px">' + esc(state.jwtOut) + '</pre>' +
+        '<span class="btn" data-action="jwt-copy">Copy decoded</span> ' +
+        '<span class="btn" data-action="jwt-clear">Clear result</span>';
+    }
+    return `
+      <div class="card">
+        <h3>JWT / bearer token decoder</h3>
+        <div class="note" style="margin-bottom:6px">Paste any token and hit Decode (or press Enter). JWTs get their header, payload, signature and expiry broken out; anything else is tried as plain base64. Runs 100% locally — nothing leaves the page.</div>
+        <input class="console-in" id="ogstats-jwt" placeholder="eyJhbGciOiJIUzI1NiIs... — paste any token here" value="${esc(state.jwtInput)}">
+        <span class="btn go" data-action="jwt-decode">Decode</span>
+        ${jwtBlock}
+      </div>
+      <div class="card">
+        <h3>Console</h3>
+        <div class="note" style="margin-bottom:6px">Runs JavaScript in the page context (like DevTools console). Use <code>google</code>, <code>fetch</code>, etc.</div>
+        <input class="console-in" id="ogstats-console" placeholder="e.g. google.maps ? 'maps loaded' : 'no maps'" value="${esc(state.consoleInput)}">
+        <span class="btn go" data-action="console-run">Run</span>
+        <span class="btn" data-action="console-clear">Clear</span>
+        <pre class="raw" style="margin-top:8px">${out || '<i>— console output appears here —</i>'}</pre>
+      </div>`;
+  }
+
+  function renderHelp() {
+    const attrs = [
+      ['Name / Value', 'The only parts visible to JavaScript via document.cookie. Everything else is metadata.'],
+      ['Domain', 'Which host(s) the cookie is sent to. A leading dot (.example.com) means all subdomains.'],
+      ['Path', 'URL prefix the cookie is scoped to — / means every page.'],
+      ['Expires / Max-Age', 'When the cookie dies. No expiry = session cookie (cleared when the browser closes).'],
+      ['HttpOnly', 'JavaScript cannot read it (XSS protection). Only visible in this panel via GM_cookie.'],
+      ['Secure', 'Only sent over HTTPS.'],
+      ['SameSite', 'Lax/Strict limit cross-site sending; None (requires Secure) allows it — used for embeds & OAuth.'],
+      ['__Secure- / __Host- prefixes', 'Name prefixes enforced by the browser: HTTPS-only, and (__Host-) no domain attribute with path=/.']
+    ].map(([k, v]) => '<div class="row"><div class="k">' + esc(k) + '</div><div class="v">' + esc(v) + '</div></div>').join('');
+    const known = Object.keys(COOKIE_INFO).sort().map(k =>
+      '<div class="row"><div class="k">' + esc(k) + '</div><div class="v">' + esc(COOKIE_INFO[k]) + '</div></div>').join('');
+    return `
+      <div class="card"><h3>What am I looking at?</h3>
+        <div class="note big">This is a debugger/inspector panel, in the spirit of an IDM floating window. It reads data that the page itself can access from your logged-in session: Street View state, cookies, storage and traffic. It runs entirely locally — nothing is uploaded.</div>
+      </div>
+      <div class="card"><h3>Token logins (Tokens tab)</h3>
+        <div class="note">
+          · Detected tokens (storage secrets, bearer JWTs, session cookies) can be saved with a custom label.<br>
+          · "Save current session as profile" stores them all under one label — ideal for multiple accounts.<br>
+          · "Log in with this token" writes the saved items back, removes competing storage tokens, and reloads the page.<br>
+          · Saved tokens are stored in the userscript manager's GM storage (not in page storage), so they survive reloads.<br>
+          · A JWT that shows EXPIRED will no longer work — re-login on the hub and save it again.
+        </div>
+      </div>
+      <div class="card"><h3>Cookie attribute glossary</h3>${attrs}</div>
+      <div class="card"><h3>Known cookie names</h3>${known}</div>
+      <div class="card"><h3>Tips for your own hub</h3>
+        <div class="note">
+          · Edit <b>CFG.hosts</b> (top of the script) to your hub hostname.<br>
+          · Edit <b>CFG.userEndpoints</b> to match your hub's user API routes.<br>
+          · The Location tab fills from live Street View objects; the wire capture also catches coordinates in API/WebSocket traffic.<br>
+          · HttpOnly cookie editing needs GM_cookie permissions in your userscript manager.<br>
+          · Ctrl+Shift+O toggles the panel; the panel position is remembered.
+        </div>
+      </div>`;
+  }
+
+  // ---------- modal ----------
+
+  function openCookieModal(c) {
+    state.modal = {
+      type: 'cookie',
+      title: c ? 'Edit cookie' : 'Add cookie',
+      name: c ? c.name : '',
+      value: c ? c.value : '',
+      domain: c && c.domain ? c.domain : location.hostname,
+      path: c && c.path ? c.path : '/',
+      expires: c && c.expirationDate ? new Date(c.expirationDate * 1000).toISOString().slice(0, 10) : '',
+      secure: c ? (c.secure !== false) : (location.protocol === 'https:'),
+      httpOnly: c ? !!c.httpOnly : false,
+      isNew: !c
+    };
+    renderModal();
+  }
+
+  function openStorageModal(storeName, key) {
+    const storeObj = storeName === 'session' ? sessionStorage : localStorage;
+    state.modal = {
+      type: 'storage',
+      title: 'Edit storage value',
+      store: storeName,
+      key: key,
+      value: storeObj.getItem(key) || ''
+    };
+    renderModal();
+  }
+
+  function openLabelModal(opts) {
+    state.modal = {
+      type: 'label',
+      title: opts.title || 'Label this token',
+      hint: opts.hint || '',
+      value: opts.value || '',
+      payload: opts.payload || []
+    };
+    renderModal();
+  }
+
+  function renderModal() {
+    const m = state.modal;
+    let el = shadow.querySelector('.modal-wrap');
+    if (!m) { if (el) el.remove(); return; }
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'modal-wrap';
+      shadow.appendChild(el);
+    }
+    if (m.type === 'storage') {
+      el.innerHTML = `<div class="modal">
+        <h3>${esc(m.title)}</h3>
+        <label>Key (${m.store === 'session' ? 'sessionStorage' : 'localStorage'})</label>
+        <input value="${esc(m.key)}" readonly>
+        <label>Value</label>
+        <input id="m-value" value="${esc(m.value)}">
+        <div class="foot">
+          <span class="btn" data-action="modal-cancel">Cancel</span>
+          <span class="btn go" data-action="modal-save-storage">Save value</span>
+        </div>
+      </div>`;
+      return;
+    }
+    if (m.type === 'label') {
+      el.innerHTML = `<div class="modal">
+        <h3>${esc(m.title)}</h3>
+        <div class="note" style="margin-bottom:8px">${esc(m.hint)}</div>
+        <label>Label</label>
+        <input id="m-label" value="${esc(m.value)}" placeholder="e.g. main account">
+        <div class="foot">
+          <span class="btn" data-action="modal-cancel">Cancel</span>
+          <span class="btn go" data-action="modal-save-label">Save token</span>
+        </div>
+      </div>`;
+      return;
+    }
+    el.innerHTML = `<div class="modal">
+      <h3>${esc(m.title)}</h3>
+      ${m.isNew ? '<label>Name</label><input id="m-name" value="">' : '<label>Name</label><input id="m-name" value="' + esc(m.name) + '" readonly>'}
+      <label>Value</label><input id="m-value" value="${esc(m.value)}">
+      <label>Domain</label><input id="m-domain" value="${esc(m.domain)}">
+      <label>Path</label><input id="m-path" value="${esc(m.path)}">
+      <label>Expires (YYYY-MM-DD, blank = session)</label><input id="m-expires" value="${esc(m.expires)}" placeholder="leave blank for session cookie">
+      <label style="display:flex;gap:8px;align-items:center;margin-top:10px"><input type="checkbox" id="m-secure" style="width:auto" ${m.secure ? 'checked' : ''}> Secure (HTTPS only)</label>
+      <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="m-httponly" style="width:auto" ${m.httpOnly ? 'checked' : ''}> HttpOnly (needs GM_cookie)</label>
+      <div class="foot">
+        <span class="btn" data-action="modal-cancel">Cancel</span>
+        <span class="btn go" data-action="modal-save">Save cookie</span>
+      </div>
+    </div>`;
+  }
+
+  // ---------- main render ----------
+
+  function render() {
+    if (!panel) return;
+    const tabs = tabList();
+    if (!tabs.some(t => t[0] === state.tab)) state.tab = 'overview';
+    const advanced = state.mode === 'advanced';
+    panel.className = 'panel ' + (advanced ? 'advanced' : 'basic') + (state.size === 'wide' ? ' wide' : '');
+    panel.style.left = Math.max(0, Math.min(state.pos.x, window.innerWidth - 80)) + 'px';
+    panel.style.top = Math.max(0, Math.min(state.pos.y, window.innerHeight - 40)) + 'px';
+
+    let body = '';
+    switch (state.tab) {
+      case 'overview': body = renderOverview(); break;
+      case 'location': body = renderLocation(); break;
+      case 'google': body = renderGoogle(); break;
+      case 'cookies': body = renderCookies(); break;
+      case 'user': body = renderUser(); break;
+      case 'tokens': body = renderTokens(); break;
+      case 'network': body = renderNetwork(); break;
+      case 'storage': body = renderStorage(); break;
+      case 'raw': body = renderRaw(); break;
+      case 'console': body = renderConsole(); break;
+      case 'help': body = renderHelp(); break;
+      default: body = renderOverview();
+    }
+
+    panel.innerHTML = `
+      <div class="hdr" data-drag="1">
+        <span class="logo"></span>
+        <span class="title">OG STATS — ${esc(location.hostname)}</span>
+        <span class="mode ${advanced ? 'adv' : ''}" data-action="mode" title="Switch Basic / Advanced">${advanced ? 'ADVANCED' : 'BASIC'}</span>
+        <span class="hbtn" data-action="size" title="Toggle width">${state.size === 'wide' ? '⇤' : '⇥'}</span>
+        <span class="hbtn" data-action="min" title="Minimize">—</span>
+        <span class="hbtn" data-action="close" title="Close (Ctrl+Shift+O)">✕</span>
+      </div>
+      <div class="tabs">${tabs.map(t => '<span class="tab ' + (state.tab === t[0] ? 'on' : '') + '" data-action="tab" data-tab="' + t[0] + '">' + t[1] + '</span>').join('')}</div>
+      <div class="body">${body}</div>`;
+    // don't rebuild the modal while the user is typing in it (live re-render)
+    const typing = state.modal && shadow.activeElement && shadow.activeElement.closest &&
+      shadow.activeElement.closest('.modal-wrap');
+    if (!typing) renderModal();
+  }
+
+  function softRefreshNet() {
+    // light-weight: only redraw when the network tab is visible
+    if (netTimer) return;
+    netTimer = setTimeout(() => {
+      netTimer = null;
+      if (panel && state.visible && !state.minimized && state.tab === 'network') render();
+    }, 1500);
+  }
+
+  // ---------- actions ----------
+
+  function onAction(action, el, ev) {
+    const i = el.getAttribute('data-i');
+    switch (action) {
+      case 'tab': state.tab = el.getAttribute('data-tab'); render(); break;
+      case 'mode':
+        state.mode = state.mode === 'basic' ? 'advanced' : 'basic';
+        store('mode', state.mode); render(); break;
+      case 'size':
+        state.size = state.size === 'wide' ? 'normal' : 'wide';
+        store('size', state.size); render(); break;
+      case 'min': state.minimized = true; renderPill(); break;
+      case 'close': state.visible = false; hidePanel(); break;
+      case 'refresh': (async () => { await refreshCookies(); render(); })(); break;
+      case 'copy': copyText(el.getAttribute('data-copy')); flash(el, '✓ copied'); break;
+      case 'snapshot-copy': copyText(JSON.stringify(snapshot(), null, 2)); flash(el, '✓ copied'); break;
+      case 'snapshot-download': {
+        const blob = new Blob([JSON.stringify(snapshot(), null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'ogstats-' + location.hostname + '-' + Date.now() + '.json';
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        break;
+      }
+      case 'gmaps': {
+        const lp = state.livePanoData;
+        if (lp && isFinite(lp.lat)) window.open('https://www.google.com/maps/@' + lp.lat + ',' + lp.lng + ',3z', '_blank');
+        else if (lp && lp.pano) window.open('https://www.google.com/maps/@?api=1&map_action=pano&pano=' + encodeURIComponent(lp.pano), '_blank');
+        break;
+      }
+      case 'ck-copy-val': copyText(state.cookies[i].value); flash(el, '✓'); break;
+      case 'ck-copy-raw': copyText(cookieRaw(state.cookies[i])); flash(el, '✓'); break;
+      case 'ck-copy-json': copyText(JSON.stringify(state.cookies[i], null, 2)); flash(el, '✓'); break;
+      case 'ck-copy-all': copyText(JSON.stringify(state.cookies, null, 2)); flash(el, '✓ all cookies copied'); break;
+      case 'ck-export': {
+        const blob = new Blob([JSON.stringify(state.cookies, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'cookies-' + location.hostname + '-' + Date.now() + '.json';
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+        break;
+      }
+      case 'ck-edit': openCookieModal(state.cookies[i]); break;
+      case 'ck-add': openCookieModal(null); break;
+      case 'ck-del': (async () => { await deleteCookie(state.cookies[i]); render(); })(); break;
+      case 'st-edit': openStorageModal(el.getAttribute('data-store'), el.getAttribute('data-key')); break;
+      case 'st-del': {
+        const sn = el.getAttribute('data-store');
+        (sn === 'session' ? sessionStorage : localStorage).removeItem(el.getAttribute('data-key'));
+        scanTokens();
+        render();
+        break;
+      }
+      case 'tok-save-one': {
+        const it = state.detectedAuth[i];
+        if (!it) break;
+        openLabelModal({
+          title: 'Save token with label',
+          hint: 'Give this token a name so you recognise it later (e.g. "alt account"). It appears in the saved list with a one-click login button.',
+          value: it.key,
+          payload: [it]
+        });
+        break;
+      }
+      case 'tok-save-session':
+        openLabelModal({
+          title: 'Save current session as profile',
+          hint: 'All tokens detected below (storage secrets / bearer JWTs / session cookies) are saved together under one label. Use its "Log in" button to switch back to this account anytime.',
+          value: 'account @ ' + location.hostname,
+          payload: detectAuthItems()
+        });
+        break;
+      case 'modal-save-label': {
+        const m = state.modal;
+        const input = shadow.getElementById('m-label');
+        const label = input ? input.value : '';
+        if (m && m.type === 'label') {
+          saveTokenProfile(label, m.payload || []);
+        }
+        state.modal = null;
+        render();
+        break;
+      }
+      case 'tok-login': {
+        const p = state.savedTokens[i];
+        if (p) loginWithProfile(p);
+        break;
+      }
+      case 'tok-copy': copyText(JSON.stringify(state.savedTokens[i], null, 2)); flash(el, '✓'); break;
+      case 'tok-del':
+        state.savedTokens.splice(i, 1);
+        store('savedTokens', state.savedTokens);
+        render();
+        break;
+      case 'modal-save-storage': {
+        const m = state.modal;
+        const input = shadow.getElementById('m-value');
+        const storeObj = m.store === 'session' ? sessionStorage : localStorage;
+        storeObj.setItem(m.key, input ? input.value : '');
+        state.modal = null;
+        scanTokens();
+        render();
+        break;
+      }
+      case 'modal-cancel': state.modal = null; renderModal(); break;
+      case 'modal-save': (async () => {
+        const g = id => { const e = shadow.getElementById(id); return e ? e.value : ''; };
+        const m = state.modal;
+        const expiresRaw = g('m-expires');
+        const expires = expiresRaw ? new Date(expiresRaw + 'T23:59:59').getTime() / 1000 : undefined;
+        await saveCookie({
+          name: m.isNew ? g('m-name').trim() : m.name,
+          value: g('m-value'),
+          domain: g('m-domain').trim(),
+          path: g('m-path').trim() || '/',
+          expires: expires,
+          secure: shadow.getElementById('m-secure').checked,
+          httpOnly: shadow.getElementById('m-httponly').checked
+        });
+        state.modal = null;
+        await refreshCookies();
+        render();
+      })(); break;
+      case 'user-fetch': (async () => { await fetchUserStats(); render(); })(); break;
+      case 'net-toggle': el.classList.toggle('open'); break;
+      case 'net-pause': state.netPaused = !state.netPaused; render(); break;
+      case 'net-clear': state.netLog = []; render(); break;
+      case 'net-copy': copyText(JSON.stringify(state.netLog, null, 2)); flash(el, '✓'); break;
+      case 'console-run': {
+        const input = shadow.getElementById('ogstats-console');
+        const code = input ? input.value : '';
+        state.consoleInput = code;
+        state.consoleOut.push('> ' + code);
+        try {
+          const result = W.eval ? W.eval(code) : (0, eval)(code);
+          let out;
+          try { out = JSON.stringify(result, null, 2); if (out === undefined) out = String(result); }
+          catch (e) { out = String(result); }
+          state.consoleOut.push(out != null ? out : 'undefined');
+        } catch (e) {
+          state.consoleOut.push('✖ ' + String(e));
+        }
+        render();
+        break;
+      }
+      case 'jwt-decode': {
+        const input = shadow.getElementById('ogstats-jwt');
+        const raw = input ? input.value.trim() : '';
+        state.jwtInput = raw;
+        if (!raw) { state.jwtOut = 'Paste a token first.'; render(); break; }
+        const d = decodeJwt(raw);
+        if (d) {
+          const iatTxt = d.payload.iat ? '\nissued:   ' + new Date(d.payload.iat * 1000).toISOString() : '';
+          let expTxt = '';
+          if (d.payload.exp) {
+            const ms = d.payload.exp * 1000;
+            expTxt = '\nexpires:  ' + new Date(ms).toISOString() + (ms < Date.now() ? '   (EXPIRED)' : '   (valid)');
+          }
+          state.jwtOut = 'JWT — header:\n' + JSON.stringify(d.header, null, 2) +
+            '\n\nJWT — payload:\n' + JSON.stringify(d.payload, null, 2) +
+            (d.sig ? '\n\nsignature (base64url — only your server can forge a new one):\n' + d.sig : '') +
+            iatTxt + expTxt;
+        } else {
+          try {
+            state.jwtOut = 'Not a JWT — decoded as base64:\n\n' + b64UrlDecode(raw);
+          } catch (e) {
+            state.jwtOut = '✖ Could not decode: not a valid JWT or base64.';
+          }
+        }
+        render();
+        break;
+      }
+      case 'jwt-copy': copyText(state.jwtOut); flash(el, '✓'); break;
+      case 'jwt-clear': state.jwtOut = ''; state.jwtInput = ''; render(); break;
+      case 'console-clear': state.consoleOut = []; render(); break;
+    }
+  }
+
+  function flash(el, text) {
+    const old = el.textContent;
+    el.textContent = text;
+    setTimeout(() => { if (el.isConnected) el.textContent = old; }, 900);
+  }
+
+  function setupEvents() {
+    shadow.addEventListener('click', ev => {
+      const el = ev.target.closest ? ev.target.closest('[data-action]') : null;
+      if (!el) return;
+      if (el.getAttribute('data-action') === 'net-toggle') { ev.stopPropagation(); onAction('net-toggle', el, ev); return; }
+      onAction(el.getAttribute('data-action'), el, ev);
+    });
+    // panel drag
+    shadow.addEventListener('pointerdown', ev => {
+      const hdr = ev.target.closest ? ev.target.closest('[data-drag]') : null;
+      if (!hdr) return;
+      if (ev.target.closest('[data-action]')) return;
+      const startX = ev.clientX, startY = ev.clientY;
+      const ox = panel.offsetLeft, oy = panel.offsetTop;
+      const move = e => {
+        state.pos = { x: ox + e.clientX - startX, y: oy + e.clientY - startY };
+        panel.style.left = Math.max(0, state.pos.x) + 'px';
+        panel.style.top = Math.max(0, state.pos.y) + 'px';
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', move);
+        document.removeEventListener('pointerup', up);
+        store('pos', state.pos);
+      };
+      document.addEventListener('pointermove', move);
+      document.addEventListener('pointerup', up);
+    });
+    // console / decoder Enter keys
+    shadow.addEventListener('keydown', ev => {
+      if (!ev.target || ev.key !== 'Enter') return;
+      if (ev.target.id === 'ogstats-console') {
+        ev.preventDefault();
+        onAction('console-run', ev.target, ev);
+      } else if (ev.target.id === 'ogstats-jwt') {
+        ev.preventDefault();
+        onAction('jwt-decode', ev.target, ev);
+      }
+    });
+    // minimize pill
+    shadow.addEventListener('click', ev => {
+      if (ev.target && ev.target.id === 'ogstats-pill') {
+        state.minimized = false; state.visible = true;
+        ev.target.remove(); render(); showPanel();
+      }
+    });
+  }
+
+  function showPanel() { if (panel) { panel.style.display = 'flex'; render(); } }
+  function hidePanel() { if (panel) panel.style.display = 'none'; }
+
+  function renderPill() {
+    if (panel) panel.style.display = 'none';
+    let pill = shadow.getElementById('ogstats-pill');
+    if (!pill) {
+      pill = document.createElement('div');
+      pill.className = 'pill';
+      pill.id = 'ogstats-pill';
+      pill.textContent = '📍 OG Stats';
+      shadow.appendChild(pill);
+    }
+  }
+
+  function ensurePanel() {
+    if (host) return;
+    host = document.createElement('div');
+    host.id = 'ogstats-host';
+    document.documentElement.appendChild(host);
+    shadow = host.attachShadow ? host.attachShadow({ mode: 'open' }) : host.createShadowRoot();
+    const style = document.createElement('style');
+    style.textContent = CSS;
+    shadow.appendChild(style);
+    panel = document.createElement('div');
+    panel.className = 'panel basic';
+    shadow.appendChild(panel);
+    setupEvents();
+  }
+
+  function togglePanel() {
+    ensurePanel();
+    if (state.minimized) { state.minimized = false; const p = shadow.getElementById('ogstats-pill'); if (p) p.remove(); }
+    state.visible = !state.visible;
+    if (state.visible) { refreshCookies().then(render); showPanel(); } else { hidePanel(); if (state.minimized) renderPill(); }
+  }
+
+  /* ================================ BOOT ================================= */
+
+  function bootUI() {
+    if (state.active && state.visible && !state.minimized) {
+      ensurePanel();
+      refreshCookies().then(render);
+      showPanel();
+    }
+  }
+
+  function activate() {
+    state.active = true;
+    // hooks (document-start: run as early as possible)
+    try { patchFetch(); } catch (e) { /* ignore */ }
+    try { patchXHR(); } catch (e) { /* ignore */ }
+    try { patchWebSocket(); } catch (e) { /* ignore */ }
+    // google maps tracker
+    const mapsTimer = setInterval(() => {
+      mapsPollTries++;
+      if ((patchGoogleMaps() && mapsPatched) || mapsPollTries > 360) clearInterval(mapsTimer);
+    }, 500);
+    setInterval(pollPanos, CFG.refreshMs);
+    setInterval(() => {
+      if (panel && state.visible && !state.minimized &&
+          (state.tab === 'location' || state.tab === 'google' || state.tab === 'overview')) {
+        render();
+      }
+    }, 1500);
+    // UI when DOM is ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => { scanTokens(); bootUI(); });
+    } else {
+      scanTokens(); bootUI();
+    }
+    // hotkey
+    document.addEventListener('keydown', ev => {
+      if (ev.ctrlKey && ev.shiftKey && (ev.key === 'O' || ev.key === 'o')) {
+        ev.preventDefault();
+        togglePanel();
+      }
+    }, true);
+    console.log('[OG Stats] Inspector active on ' + location.hostname);
+  }
+
+  // menu commands (available even when the host is not auto-activated)
+  try {
+    if (typeof GM_registerMenuCommand === 'function') {
+      GM_registerMenuCommand('OG Stats: toggle panel (Ctrl+Shift+O)', () => {
+        if (!state.active) activate();
+        togglePanel();
+      });
+      GM_registerMenuCommand('OG Stats: enable on this host', () => {
+        store('host.' + location.hostname, true);
+        if (!state.active) activate(); else bootUI();
+        alert('[OG Stats] Enabled on ' + location.hostname);
+      });
+      GM_registerMenuCommand('OG Stats: switch Basic / Advanced', () => {
+        state.mode = state.mode === 'basic' ? 'advanced' : 'basic';
+        store('mode', state.mode);
+        if (!state.active) activate();
+        if (!state.visible) { state.visible = true; }
+        if (state.minimized) state.minimized = false;
+        bootUI();
+      });
+      GM_registerMenuCommand('OG Stats: save current login as token profile', () => {
+        if (!state.active) activate();
+        const items = detectAuthItems();
+        if (!items.length) { alert('[OG Stats] No tokens detected on this page — sign in first.'); return; }
+        const label = prompt('[OG Stats] Label for this login:', 'account @ ' + location.hostname);
+        if (label === null) return;
+        saveTokenProfile(label, items);
+        alert('[OG Stats] Saved ' + items.length + ' token(s) as "' + (label || 'Untitled token') + '" — log in anytime from the Tokens tab.');
+      });
+    }
+  } catch (e) { /* ignore */ }
+
+  if (isTargetSite()) {
+    activate();
+  } else {
+    console.log('[OG Stats] Not active on ' + location.hostname + ' — use the userscript-manager menu command "OG Stats: enable on this host", or add the hostname to CFG.hosts.');
+  }
+})();
