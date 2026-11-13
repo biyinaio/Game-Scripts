@@ -1,0 +1,347 @@
+// ==UserScript==
+// @name         Openguessr User Check (Ranged)
+// @namespace    https://openguessr.com/
+// @version      1.1
+// @description  Checks username availability through the Add a friend search, using a min-max length range
+// @match        https://openguessr.com/multiplayer*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      api.urbandictionary.com
+// @connect      api.datamuse.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /* ---------- settings ---------- */
+  const DEF = {
+    minLen: 3, maxLen: 6, mode: 'random', letters: true, numbers: true,
+    urban: true, datamuse: true, delay: 1000, x: 360, y: 80, h: 520
+  };
+  const S = Object.assign({}, DEF, GM_getValue('ogrcheck', {}));
+  const save = () => GM_setValue('ogrcheck', S);
+
+  /* ---------- state ---------- */
+  let running = false;
+  const checked = new Set();
+  const pools = {};
+  let incLen = S.minLen;       // increasing mode: current length
+  let counter = 0;             // increasing mode: counter within current length
+  let stats = { total: 0, free: 0, taken: 0 };
+  const free = [];
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const rnd = n => Math.floor(Math.random() * n);
+  const resetInc = () => { incLen = S.minLen; counter = 0; };
+
+  /* ---------- GUI ---------- */
+  const css = `
+  #ogr{position:fixed !important;z-index:999999 !important;width:320px !important;background:#1b2030 !important;color:#e8ebf5 !important;
+    font:13px system-ui,sans-serif !important;border:1px solid #3a4260 !important;border-radius:10px !important;
+    box-shadow:0 6px 24px #0009 !important;display:flex !important;flex-direction:column !important;
+    min-height:160px !important;max-height:95vh !important}
+  #ogr *{box-sizing:border-box !important;font-family:system-ui,sans-serif;letter-spacing:normal !important}
+  #ogr .h{padding:8px 10px;cursor:move;background:#262d45;border-radius:10px 10px 0 0;font-weight:700;
+    display:flex;justify-content:space-between;flex:0 0 auto;font-size:14px !important}
+  #ogr .b{padding:10px;display:flex;flex-direction:column;gap:10px;flex:1 1 auto;overflow-y:auto;min-height:0}
+  #ogr .b > *{flex-shrink:0 !important}
+  #ogr label{display:flex !important;align-items:center;gap:6px;font-size:13px !important;margin:0 !important;width:auto !important}
+  #ogr input[type=range]{flex:1;width:auto !important;height:auto !important;padding:0 !important}
+  #ogr input[type=checkbox],#ogr input[type=radio]{width:16px !important;height:16px !important;min-width:16px;margin:0 !important;padding:0 !important;flex:0 0 auto}
+  #ogr input[type=number]{
+    width:100% !important;height:34px !important;background:#121622 !important;color:#fff !important;
+    border:1px solid #3a4260 !important;border-radius:5px !important;padding:4px 8px !important;font-size:13px !important;margin:0 !important}
+  #ogr #ogr-delay{width:120px !important}
+  #ogr button{background:#3b5bdb !important;color:#fff !important;border:0 !important;border-radius:6px !important;
+    padding:8px !important;cursor:pointer;font-weight:600 !important;font-size:13px !important;height:auto !important}
+  #ogr button.stop{background:#c92a2a !important}
+  #ogr button.alt{background:#3a4260 !important}
+  #ogr fieldset{border:1px solid #3a4260 !important;border-radius:6px !important;padding:8px !important;margin:0 !important;
+    display:flex !important;flex-direction:column;gap:6px;min-width:0}
+  #ogr legend{padding:0 4px !important;color:#9aa5cf !important;width:auto !important;font-size:12px !important}
+  #ogr .row{display:flex;gap:12px;align-items:center}
+  #ogr .log{background:#121622;border-radius:5px;padding:6px;font:12px monospace !important;
+    white-space:pre-wrap;border:1px solid #3a4260}
+  #ogr .ok{color:#51cf66}.no{color:#ff6b6b}.mu{color:#9aa5cf}
+  #ogr textarea{width:100% !important;background:#121622 !important;
+    color:#51cf66 !important;border:1px solid #3a4260 !important;border-radius:5px !important;
+    font:12px monospace !important;padding:6px !important;margin:0 !important}
+  #ogr .grip{flex:0 0 auto;height:14px;cursor:ns-resize;background:#262d45;border-radius:0 0 10px 10px;position:relative}
+  #ogr .grip::after{content:'';position:absolute;left:50%;top:5px;width:40px;margin-left:-20px;height:4px;border-radius:2px;background:#5a6490}
+  `;
+  const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style);
+
+  const box = document.createElement('div');
+  box.id = 'ogr';
+  box.style.left = S.x + 'px'; box.style.top = S.y + 'px'; box.style.height = S.h + 'px';
+  box.innerHTML = `
+    <div class="h"><span>Openguessr User Check (Ranged)</span><span id="ogr-min" style="cursor:pointer;padding:0 6px">–</span></div>
+    <div class="b" id="ogr-body">
+      <fieldset><legend>Length range</legend>
+        <label>Min: <b id="ogr-minv" style="min-width:20px"></b>
+          <input type="range" id="ogr-minlen" min="1" max="20"></label>
+        <label>Max: <b id="ogr-maxv" style="min-width:20px"></b>
+          <input type="range" id="ogr-maxlen" min="1" max="20"></label>
+      </fieldset>
+      <fieldset><legend>Mode</legend>
+        <label><input type="radio" name="ogr-mode" value="random"> Random</label>
+        <label><input type="radio" name="ogr-mode" value="words"> Words</label>
+        <label><input type="radio" name="ogr-mode" value="increasing"> Increasing</label>
+      </fieldset>
+      <fieldset><legend>Characters</legend>
+        <div class="row">
+          <label><input type="checkbox" id="ogr-letters"> Letters</label>
+          <label><input type="checkbox" id="ogr-numbers"> Numbers</label>
+        </div>
+      </fieldset>
+      <fieldset><legend>Word sources (Words mode)</legend>
+        <label><input type="checkbox" id="ogr-urban"> Urban Dictionary</label>
+        <label><input type="checkbox" id="ogr-datamuse"> Datamuse (English words)</label>
+      </fieldset>
+      <label>Delay (ms): <input type="number" id="ogr-delay" min="0" step="100" autocomplete="off"></label>
+      <div class="row">
+        <button id="ogr-go" style="flex:1">Start</button>
+        <button id="ogr-clear" class="alt">Clear</button>
+      </div>
+      <div class="mu" id="ogr-stats"></div>
+      <div class="log" id="ogr-log"></div>
+      <textarea id="ogr-free" readonly placeholder="Available usernames appear here"></textarea>
+      <button id="ogr-copy" class="alt">Copy available</button>
+    </div>
+    <div class="grip" id="ogr-grip" title="Drag to resize"></div>`;
+  document.body.appendChild(box);
+  const $ = id => document.getElementById('ogr-' + id);
+
+  const force = (el, props) => Object.entries(props).forEach(([k, v]) => el.style.setProperty(k, v, 'important'));
+  force($('log'),  { display: 'block', height: '200px', 'min-height': '120px', 'max-height': 'none', flex: '0 0 auto', overflow: 'auto', resize: 'vertical' });
+  force($('free'), { display: 'block', height: '110px', 'min-height': '70px', flex: '0 0 auto', resize: 'vertical' });
+
+  function syncUI() {
+    $('minlen').value = S.minLen; $('maxlen').value = S.maxLen;
+    $('minv').textContent = S.minLen; $('maxv').textContent = S.maxLen;
+    document.querySelectorAll('input[name=ogr-mode]').forEach(r => r.checked = r.value === S.mode);
+    $('letters').checked = S.letters; $('numbers').checked = S.numbers;
+    $('urban').checked = S.urban; $('datamuse').checked = S.datamuse;
+    $('delay').value = S.delay;
+  }
+  syncUI();
+
+  // keep min <= max (the slider you move pushes the other one)
+  $('minlen').oninput = e => {
+    S.minLen = +e.target.value;
+    if (S.minLen > S.maxLen) S.maxLen = S.minLen;
+    syncUI(); resetInc(); save();
+  };
+  $('maxlen').oninput = e => {
+    S.maxLen = +e.target.value;
+    if (S.maxLen < S.minLen) S.minLen = S.maxLen;
+    syncUI(); resetInc(); save();
+  };
+  document.querySelectorAll('input[name=ogr-mode]').forEach(r => r.onchange = () => { S.mode = r.value; resetInc(); save(); });
+  ['letters', 'numbers', 'urban', 'datamuse'].forEach(k => $(k).onchange = e => { S[k] = e.target.checked; resetInc(); save(); });
+  $('delay').onchange = e => {
+    const v = parseInt(e.target.value, 10);
+    S.delay = Number.isFinite(v) ? Math.max(0, v) : 1000;
+    e.target.value = S.delay; save();
+  };
+  $('min').onclick = () => {
+    const collapsed = $('body').style.display === 'none';
+    $('body').style.display = collapsed ? '' : 'none';
+    $('grip').style.display = collapsed ? '' : 'none';
+    box.style.height = collapsed ? S.h + 'px' : 'auto';
+    box.style.minHeight = collapsed ? '' : '0';
+  };
+  $('clear').onclick = () => { $('log').innerHTML = ''; $('free').value = ''; free.length = 0; checked.clear(); stats = { total: 0, free: 0, taken: 0 }; resetInc(); renderStats(); };
+  $('copy').onclick = () => navigator.clipboard.writeText(free.join('\n'));
+
+  // dragging the panel
+  (() => {
+    const h = box.querySelector('.h'); let dx, dy, drag = false;
+    h.onmousedown = e => { if (e.target.id === 'ogr-min') return; drag = true; dx = e.clientX - box.offsetLeft; dy = e.clientY - box.offsetTop; e.preventDefault(); };
+    document.addEventListener('mousemove', e => { if (drag) { box.style.left = (e.clientX - dx) + 'px'; box.style.top = (e.clientY - dy) + 'px'; } });
+    document.addEventListener('mouseup', () => { if (drag) { drag = false; S.x = box.offsetLeft; S.y = box.offsetTop; save(); } });
+  })();
+
+  // resizing the panel height
+  (() => {
+    const g = $('grip'); let sy, sh, rs = false;
+    g.onmousedown = e => { rs = true; sy = e.clientY; sh = box.offsetHeight; e.preventDefault(); };
+    document.addEventListener('mousemove', e => {
+      if (!rs) return;
+      const max = window.innerHeight * 0.95;
+      box.style.height = Math.min(max, Math.max(160, sh + e.clientY - sy)) + 'px';
+    });
+    document.addEventListener('mouseup', () => { if (rs) { rs = false; S.h = box.offsetHeight; save(); } });
+  })();
+
+  function log(msg, cls) {
+    const d = document.createElement('div'); d.className = cls || ''; d.textContent = msg;
+    force(d, { display: 'block', height: 'auto', 'min-height': '16px', flex: '0 0 auto', 'line-height': '16px' });
+    const l = $('log'); l.appendChild(d); l.scrollTop = l.scrollHeight;
+    while (l.children.length > 300) l.removeChild(l.firstChild);
+  }
+  function renderStats() {
+    $('stats').textContent = `Checked: ${stats.total} | Available: ${stats.free} | Taken: ${stats.taken}`;
+  }
+  renderStats();
+
+  /* ---------- name generation ---------- */
+  function charset() {
+    let c = '';
+    if (S.numbers) c += '0123456789';
+    if (S.letters) c += 'abcdefghijklmnopqrstuvwxyz';
+    return c;
+  }
+
+  function gmGet(url) {
+    return new Promise((res, rej) => GM_xmlhttpRequest({
+      method: 'GET', url, timeout: 10000,
+      onload: r => { try { res(JSON.parse(r.responseText)); } catch (e) { rej(e); } },
+      onerror: rej, ontimeout: () => rej(new Error('timeout'))
+    }));
+  }
+  const clean = w => String(w).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+  async function fillPool(len) {
+    const found = [];
+    const tasks = [];
+    if (S.urban) tasks.push(gmGet('https://api.urbandictionary.com/v0/random')
+      .then(j => (j.list || []).forEach(x => found.push(x.word))).catch(() => log('Urban source failed', 'mu')));
+    if (S.datamuse) tasks.push(gmGet('https://api.datamuse.com/words?max=1000&sp=' + encodeURIComponent('?'.repeat(len)))
+      .then(j => j.forEach(x => found.push(x.word))).catch(() => log('Datamuse source failed', 'mu')));
+    await Promise.all(tasks);
+    const pool = pools[len] || (pools[len] = []);
+    found.map(clean).filter(w => w.length === len && /^[a-z0-9]+$/.test(w) && (S.letters || !/[a-z]/.test(w)))
+      .forEach(w => { if (!checked.has(w) && !pool.includes(w)) pool.push(w); });
+  }
+
+  const randLen = () => S.minLen + rnd(S.maxLen - S.minLen + 1);
+
+  async function nextName() {
+    const cs = charset();
+    if (!cs) throw new Error('Enable Letters and/or Numbers');
+
+    if (S.mode === 'random') {
+      for (let i = 0; i < 1000; i++) {
+        const len = randLen();
+        let n = ''; for (let j = 0; j < len; j++) n += cs[rnd(cs.length)];
+        if (!checked.has(n)) return n;
+      }
+      return null;
+    }
+
+    if (S.mode === 'increasing') {
+      // counts up through every combination at the current length, then moves to the next length in the range
+      const base = cs.length;
+      while (incLen <= S.maxLen) {
+        if (counter < Math.pow(base, incLen)) {
+          let v = counter++, n = '';
+          for (let j = 0; j < incLen; j++) { n = cs[v % base] + n; v = Math.floor(v / base); }
+          return n;
+        }
+        incLen++; counter = 0;
+      }
+      return null;
+    }
+
+    // words
+    if (!S.urban && !S.datamuse) throw new Error('Enable Urban Dictionary and/or Datamuse');
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const len = randLen();
+      const pool = pools[len] || (pools[len] = []);
+      if (!pool.length) await fillPool(len);
+      if (pool.length) {
+        let w = pool.splice(rnd(pool.length), 1)[0];
+        if (S.numbers && len > 1 && Math.random() < 0.5) {
+          const k = 1 + rnd(Math.min(3, len - 1));
+          let d = ''; for (let i = 0; i < k; i++) d += rnd(10);
+          w = w.slice(0, len - k) + d;
+        }
+        if (!checked.has(w)) return w;
+      }
+    }
+    log(`No words found in range ${S.minLen}-${S.maxLen}`, 'mu');
+    return null;
+  }
+
+  /* ---------- page interaction ---------- */
+  function findInput() {
+    return [...document.querySelectorAll('input')].find(i => /search for a player/i.test(i.placeholder || ''));
+  }
+  function setValue(input, v) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, v);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  function searchButton(input) {
+    let el = input.parentElement;
+    for (let i = 0; i < 3 && el; i++, el = el.parentElement) {
+      const b = [...el.querySelectorAll('button')].find(b => !b.textContent.trim() && b.querySelector('svg'));
+      if (b) return b;
+    }
+    return null;
+  }
+  function readResults(input) {
+    let root = input;
+    while (root.parentElement && !/add a friend/i.test(root.textContent)) root = root.parentElement;
+    while (root.parentElement && /add a friend/i.test(root.parentElement.textContent) && root.parentElement !== document.body
+           && root.parentElement.querySelectorAll('input').length === 1) root = root.parentElement;
+    const names = [];
+    root.querySelectorAll('button').forEach(b => {
+      const t = b.textContent.trim();
+      if (/^(add|added|sent|pending|friends?)$/i.test(t) && b.parentElement) {
+        const row = b.parentElement;
+        const label = row.textContent.replace(b.textContent, '').trim();
+        if (label) names.push(label);
+      }
+    });
+    return names;
+  }
+
+  async function search(name) {
+    const input = findInput();
+    if (!input) throw new Error('Open the "Add a friend" dialog first');
+    setValue(input, name);
+    const btn = searchButton(input);
+    if (btn) btn.click();
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+
+    await sleep(700);
+    let last = '', stable = 0;
+    for (let t = 0; t < 30 && stable < 3; t++) {
+      const sig = readResults(input).join('|');
+      stable = sig === last ? stable + 1 : 0;
+      last = sig;
+      await sleep(150);
+    }
+    return readResults(input);
+  }
+
+  /* ---------- main loop ---------- */
+  async function run() {
+    running = true; $('go').textContent = 'Stop'; $('go').className = 'stop';
+    try {
+      while (running) {
+        const name = await nextName();
+        if (!name) { log('Out of names for these settings', 'mu'); break; }
+        checked.add(name);
+        const results = await search(name);
+        const taken = results.some(r => r.toLowerCase() === name.toLowerCase());
+        stats.total++;
+        if (taken) { stats.taken++; log(`✘ ${name}`, 'no'); }
+        else { stats.free++; free.push(name); $('free').value = free.join('\n'); log(`✔ ${name}`, 'ok'); }
+        renderStats();
+        if (S.delay > 0) await sleep(S.delay);
+      }
+    } catch (e) {
+      log('Error: ' + e.message, 'no');
+    }
+    running = false; $('go').textContent = 'Start'; $('go').className = '';
+  }
+
+  $('go').onclick = () => { if (running) running = false; else run(); };
+})();
