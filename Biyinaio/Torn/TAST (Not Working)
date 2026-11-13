@@ -1,0 +1,661 @@
+/* ====================================================================
+   TORN AUTO-STOCK TRADER (TAST) v3.1 - SIMPLE + AUTONOMOUS
+   Paste as a new script in your script hub (or Tampermonkey).
+   Runs on: https://www.torn.com/*
+
+   GUI (unchanged, still minimal): ON / OFF buttons + mode selector
+   (ASSISTED / FULL AUTO) + anonymous-sell checkbox (OFF by default).
+
+   v3.1 FULL AUTO IS AUTONOMOUS AND SNAPPY:
+   - It browses the market BY ITSELF: clicks through item links on
+     the page, jumps between market pages, revisits items - no waiting
+     for you to browse.
+   - It buys/sells IN-PAGE (no reload) whenever it can: finds the
+     matching listing row, clicks Buy, confirms, done in ~1-2s.
+   - Fast tick loop (~0.9s), instant harvest on page changes, quick
+     navigation (~1.4s min between page moves).
+   - Aggressive deal threshold in FULL AUTO (6% below average instead
+     of 12%) so trades actually fire often. Pace tracker shows
+     trades + seconds since the last one.
+   - No API key. Everything is read from the pages it visits.
+
+   THE BRAIN (no settings, constants below):
+   - Every price ever seen is saved (localStorage, forever).
+   - DEAL = item currently priced below its own rolling average.
+   - SELL = holding item that climbed above your cost (+fee margin).
+   - Fees: 5% market tax, +10% only if anonymous is ticked.
+
+   WARNING (same as before): automated actions break Torn's scripting
+   rule - federal jail to account deletion. Your account, your call.
+
+   TUNING: change constants in the TUNING block.
+   ==================================================================== */
+
+(() => {
+  'use strict';
+
+  /* ------------------------------------------------------------------
+   * TUNING
+   * ------------------------------------------------------------------ */
+  const DIP_PCT       = 12;      // ASSISTED: buy when this % below average
+  const BOT_DIP_PCT   = 6;       // FULL AUTO: aggressive, more trades
+  const SELL_GAIN_PCT = 4;      // sell when up this % on cost (net)
+  const BUDGET        = 100000;  // pretend cash if sidebar can't be read
+  const MAX_QTY       = 5;       // max units per deal
+  const AVG_POINTS    = 20;      // rolling average window
+  const MIN_POINTS    = 4;       // prices seen before an item is judged
+  const TAX_MARKET    = 0.05;    // Torn's 5% market sales tax
+  const TAX_ANON      = 0.10;    // +10% only if anonymous ticked
+  const HIST_MAX      = 100;
+  const BOT_TICK_MS   = 900;     // brain tick
+  const BOT_MOVE_MS   = 1400;    // min time between page moves
+  const BOT_REVISIT_MS= 45000;   // don't revisit a link more often
+  const BUY_TIMEBOX_MS= 8000;    // max time spent on one buy action
+
+  /* ------------------------------------------------------------------
+   * SELECTORS - fix here if Torn changes its HTML
+   * ------------------------------------------------------------------ */
+  const SEL = {
+    money: '#user-money, .money, [class*="money"]',
+    buyBtn: 'a[class*="buy"], button[class*="buy"], [class*="buy-action"], .buy',
+    confirmBtn: '.confirm-btn, input[type="submit"], button[class*="confirm"], .yes',
+    sellBtn: 'a[class*="sell"], button[class*="sell"], [class*="add-listing"], .sell, [class*="addlisting" i]',
+    anonCheckbox: 'input[type="checkbox"][class*="anon"], input#anonymous, input[type="checkbox"][name*="anon"]',
+    listQtyInput: 'input[name*="quantity"], input[class*="quantity"], input[placeholder*="quantity" i]',
+    listPriceInput: 'input[name*="price"], input[class*="price"], input[placeholder*="price" i]',
+    cell: 'li, .item, div',
+    pageRows: 'li, .item, tr',
+  };
+  const PRICE_RE = /\$\s?([\d,]+)/g;
+
+  const marketUrl = (name) =>
+    `https://www.torn.com/imarket.php#/step=shop&searchName=${encodeURIComponent(name || '')}`;
+
+  /* ------------------------------------------------------------------
+   * Storage - everything persists (bot memory too, survives reloads)
+   * ------------------------------------------------------------------ */
+  const KEYS = {
+    config: 'tast3.config', hist: 'tast3.hist', positions: 'tast3.positions',
+    pnl: 'tast3.pnl', log: 'tast3.log', ui: 'tast3.ui', shop: 'tast3.shop',
+    names: 'tast3.names', bot: 'tast3.bot',
+  };
+  const store = {
+    get(k, fb) { try { const v = JSON.parse(localStorage.getItem(k)); return v ?? fb; } catch { return fb; } },
+    set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+  };
+
+  let CFG = Object.assign({ on: false, mode: 'assisted', anon: false }, store.get(KEYS.config, {}));
+  const saveConfig = () => store.set(KEYS.config, CFG);
+
+  /* ------------------------------------------------------------------
+   * Utils
+   * ------------------------------------------------------------------ */
+  const now = () => Date.now();
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const rand = (a, b) => Math.floor(a + Math.random() * (b - a));
+  const fastDelay = () => sleep(rand(250, 650));  // snappy
+  const fmt$ = (n) => '$' + Math.round(n).toLocaleString();
+  const esc = (s) => String(s).replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+  const age = (t) => { const s = Math.max(0, Math.floor((now() - t) / 1000));
+    return s < 60 ? s + 's' : s < 3600 ? Math.floor(s / 60) + 'm' : Math.floor(s / 3600) + 'h'; };
+
+  const LOG = store.get(KEYS.log, []);
+  function log(msg, kind = 'info') {
+    LOG.unshift({ t: now(), msg, kind });
+    if (LOG.length > 60) LOG.pop();
+    store.set(KEYS.log, LOG);
+    renderLog();
+  }
+
+  /* ------------------------------------------------------------------
+   * Price history + stats
+   * ------------------------------------------------------------------ */
+  const getHist = () => store.get(KEYS.hist, {});
+  function prettyName(key) {
+    const names = store.get(KEYS.names, {});
+    return names[key] || key;
+  }
+  function recordPrice(name, price) {
+    const key = name.toLowerCase();
+    const names = store.get(KEYS.names, {});
+    if (!names[key]) { names[key] = name; store.set(KEYS.names, names); }
+    const h = getHist();
+    const arr = h[key] || [];
+    const last = arr[arr.length - 1];
+    if (!last || last.p !== price) {
+      arr.push({ t: now(), p: price });
+      if (arr.length > HIST_MAX) arr.shift();
+      h[key] = arr;
+      store.set(KEYS.hist, h);
+    }
+  }
+  function stats(key) {
+    const arr = getHist()[key] || [];
+    if (arr.length < MIN_POINTS) return null;
+    const pts = arr.slice(-AVG_POINTS).map((x) => x.p);
+    const avg = pts.reduce((a, b) => a + b, 0) / pts.length;
+    const last = arr[arr.length - 1];
+    return { n: arr.length, avg, price: last.p, t: last.t };
+  }
+
+  /* ------------------------------------------------------------------
+   * Positions + P&L
+   * ------------------------------------------------------------------ */
+  const getPositions = () => store.get(KEYS.positions, {});
+  function recordBuy(name, qty, unitCost) {
+    const key = name.toLowerCase();
+    const p = getPositions();
+    const cur = p[key] || { qty: 0, avgCost: 0, name };
+    const tot = cur.qty + qty;
+    cur.avgCost = ((cur.avgCost * cur.qty) + unitCost * qty) / tot;
+    cur.qty = tot; cur.name = name;
+    p[key] = cur;
+    store.set(KEYS.positions, p);
+    log(`BUY: ${qty} x ${name} @ ${fmt$(unitCost)}`, 'trade');
+    render();
+  }
+  function recordSell(name, qty, unitNet) {
+    const key = name.toLowerCase();
+    const p = getPositions();
+    const cur = p[key];
+    if (!cur || cur.qty <= 0) return;
+    const sold = Math.min(qty, cur.qty);
+    const profit = (unitNet - cur.avgCost) * sold;
+    cur.qty -= sold;
+    if (cur.qty <= 0) delete p[key]; else p[key] = cur;
+    store.set(KEYS.positions, p);
+    const pnl = store.get(KEYS.pnl, { total: 0, trades: 0 });
+    pnl.total += profit; pnl.trades += 1;
+    store.set(KEYS.pnl, pnl);
+    log(`SELL: ${sold} x ${name} net ${fmt$(unitNet)} (${profit >= 0 ? '+' : ''}${fmt$(profit)})`, profit >= 0 ? 'trade' : 'warn');
+    render();
+  }
+
+  /* ------------------------------------------------------------------
+   * Text extraction from the page (no API, pure visual)
+   * ------------------------------------------------------------------ */
+  function domMoney() {
+    for (const el of document.querySelectorAll(SEL.money)) {
+      const m = el.textContent.match(/\$?\s?([\d,]{3,})/);
+      if (m) return parseInt(m[1].replace(/,/g, ''), 10);
+    }
+    return null;
+  }
+
+  function cleanName(alt) {
+    if (!alt) return null;
+    let n = alt.trim().split('\n')[0].trim();
+    n = n.replace(/\[[^\]]*\]/g, '').replace(/\(\d[\d,]*\)/g, '').trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9 .,'&-]{1,50}$/.test(n)) return null;
+    if (n.length < 2) return null;
+    return n;
+  }
+
+  function harvestPage() {
+    if (!CFG.on) return;
+    const seen = {};
+    let found = 0;
+    for (const img of document.querySelectorAll('img[alt]')) {
+      const name = cleanName(img.alt);
+      if (!name) continue;
+      const cell = img.closest(SEL.cell) || img.parentElement;
+      if (!cell) continue;
+      const txt = cell.innerText || '';
+      if (txt.length > 500) continue;
+      PRICE_RE.lastIndex = 0;
+      const pm = txt.match(PRICE_RE);
+      if (!pm) continue;
+      let lowest = parseInt(pm[1].replace(/,/g, ''), 10);
+      if (lowest <= 0) continue;
+      let m;
+      while ((m = PRICE_RE.exec(txt)) !== null) {
+        const p = parseInt(m[1].replace(/,/g, ''), 10);
+        if (p > 0 && p < lowest) lowest = p;
+      }
+      const key = name.toLowerCase();
+      if (!seen[key]) { seen[key] = true; recordPrice(name, lowest); found++; }
+    }
+    return found;
+  }
+
+  /* ------------------------------------------------------------------
+   * The brain
+   * ------------------------------------------------------------------ */
+  function analyze(aggressive) {
+    const cash = domMoney() ?? BUDGET;
+    const feeRate = TAX_MARKET + (CFG.anon ? TAX_ANON : 0);
+    const dip = aggressive ? BOT_DIP_PCT : DIP_PCT;
+    const shop = store.get(KEYS.shop, {});
+    const hist = getHist();
+    const deals = [];
+    const sells = [];
+
+    for (const key of Object.keys(hist)) {
+      const st = stats(key);
+      if (!st) continue;
+      const name = prettyName(key);
+      const dipPct = (st.avg - st.price) / st.avg * 100;
+
+      const s = shop[key];
+      const storeBuy = s && s.price < st.price * 0.9 ? { price: s.price, shopId: s.shopId } : null;
+      const marketDip = st.price <= st.avg * (1 - dip / 100);
+
+      if (storeBuy || marketDip) {
+        const buyPrice = storeBuy ? storeBuy.price : st.price;
+        const target = st.avg;
+        const net = Math.floor(target * (1 - feeRate));
+        const profit = net - buyPrice;
+        const qty = Math.max(0, Math.min(MAX_QTY, Math.floor(cash / Math.max(1, buyPrice))));
+        if (qty >= 1 && profit > 0)
+          deals.push({ key, name, buyPrice, source: storeBuy ? 'store' : 'market',
+            shopId: storeBuy ? storeBuy.shopId : null, avg: st.avg, dipPct,
+            target, net, profit, qty, seen: age(st.t) });
+      }
+    }
+
+    for (const [key, pos] of Object.entries(getPositions())) {
+      const st = stats(key);
+      const cur = st ? st.price : pos.avgCost;
+      const netNow = Math.floor(cur * (1 - feeRate));
+      const gainPct = pos.avgCost > 0 ? (netNow - pos.avgCost) / pos.avgCost * 100 : 0;
+      if (gainPct >= SELL_GAIN_PCT)
+        sells.push({ key, name: pos.name, qty: pos.qty, avgCost: pos.avgCost,
+          price: cur, netNow, gainPct });
+    }
+
+    deals.sort((a, b) => b.profit * b.qty - a.profit * a.qty);
+    return { cash, deals, sells };
+  }
+
+  /* ------------------------------------------------------------------
+   * Actions
+   * ------------------------------------------------------------------ */
+  function actBuy(deal) {
+    if (CFG.mode === 'full-auto') return; // the bot loop handles auto buys
+    window.open(marketUrl(deal.name), '_blank');
+    log(`ASSISTED: opened market for ${deal.name} @ ${fmt$(deal.buyPrice)} - buy ~${deal.qty}, relist near ${fmt$(deal.target)}`);
+  }
+  function actSell(sig) {
+    if (CFG.mode === 'full-auto') return;
+    window.open(marketUrl(sig.name), '_blank');
+    log(`ASSISTED: open market and list ${sig.qty} x ${sig.name} @ ~${fmt$(sig.price)}`);
+  }
+
+  function waitFor(selector, timeout = 6000) {
+    return new Promise((res, rej) => {
+      const el = document.querySelector(selector);
+      if (el) return res(el);
+      const obs = new MutationObserver(() => {
+        const el = document.querySelector(selector);
+        if (el) { obs.disconnect(); res(el); }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+      setTimeout(() => { obs.disconnect(); rej(new Error('timeout: ' + selector)); }, timeout);
+    });
+  }
+
+  // Find the listing row on THIS page selling at or below the price
+  function findRowAtPrice(price) {
+    return [...document.querySelectorAll(SEL.pageRows)].find((r) => {
+      const t = r.innerText || '';
+      if (t.length > 500) return false;
+      PRICE_RE.lastIndex = 0;
+      const m = t.match(PRICE_RE);
+      const p = m ? parseInt(m[1].replace(/,/g, ''), 10) : null;
+      if (p === null || p > Math.ceil(price * 1.02)) return false;
+      return !!r.querySelector(SEL.buyBtn) || !!r.querySelector('a, button');
+    }) || null;
+  }
+
+  // Buy in-page: click the listing's Buy button, confirm, no reload.
+  async function buyInPage(deal) {
+    const t0 = now();
+    let bought = 0;
+    while (bought < deal.qty && now() - t0 < BUY_TIMEBOX_MS) {
+      const row = findRowAtPrice(deal.buyPrice);
+      if (!row) break;
+      const btn = row.querySelector(SEL.buyBtn) || row.querySelector('a, button');
+      if (!btn) break;
+      btn.click();
+      await fastDelay();
+      try { (await waitFor(SEL.confirmBtn, 2500)).click(); } catch {}
+      bought++;
+      await fastDelay();
+    }
+    if (bought) { recordBuy(deal.name, bought, deal.buyPrice); botTraded(); return bought; }
+    return 0;
+  }
+
+  // Sell in-page: open the listing form, fill qty+price, confirm.
+  async function sellInPage(sig) {
+    const sellBtn = document.querySelector(SEL.sellBtn);
+    if (!sellBtn) return false;
+    sellBtn.click();
+    await fastDelay();
+    const qtyEl = await waitFor(SEL.listQtyInput, 3000).catch(() => null);
+    const priceEl = await waitFor(SEL.listPriceInput, 3000).catch(() => null);
+    if (!qtyEl || !priceEl) { log('AUTO: listing form not found (check SEL)', 'warn'); return false; }
+    qtyEl.value = sig.qty; qtyEl.dispatchEvent(new Event('input', { bubbles: true }));
+    await fastDelay();
+    priceEl.value = sig.price; priceEl.dispatchEvent(new Event('input', { bubbles: true }));
+    await fastDelay();
+    if (CFG.anon) {
+      const anon = document.querySelector(SEL.anonCheckbox);
+      if (anon && !anon.checked) { anon.click(); await fastDelay(); }
+    }
+    const confirm = document.querySelector(SEL.confirmBtn) ||
+      [...document.querySelectorAll('a, button')].find((b) => /confirm|list|sell/i.test(b.innerText || ''));
+    if (!confirm) { log('AUTO: confirm button not found', 'warn'); return false; }
+    confirm.click();
+    recordSell(sig.name, sig.qty, sig.netNow);
+    botTraded();
+    return true;
+  }
+
+  /* ------------------------------------------------------------------
+   * THE BOT - autonomous page browsing + trading (FULL AUTO)
+   * ------------------------------------------------------------------ */
+  const bot = Object.assign({ trades: 0, lastTrade: 0, lastMove: 0, visited: {} },
+    store.get(KEYS.bot, {}));
+  const saveBot = () => store.set(KEYS.bot, bot);
+  function botTraded() { bot.trades++; bot.lastTrade = now(); saveBot(); }
+
+  function pageLinks() {
+    return [...document.querySelectorAll('a[href]')]
+      .map((a) => ({ a, href: a.getAttribute('href') || '' }))
+      .filter((x) => x.href && /imarket\.php/i.test(x.href) &&
+        (x.href.includes('itemID') || x.href.includes('step=') || x.href.includes('#/')));
+  }
+
+  async function botTick() {
+    if (!CFG.on || CFG.mode !== 'full-auto' || document.hidden) return;
+    if (bot.busy) return;
+    bot.busy = true;
+    try {
+      // 1. read the page we're on right now
+      harvestPage();
+
+      // 2. trade if there's something to do ON THIS PAGE
+      const a = analyze(true);
+      if (a.sells.length) {
+        const ok = await sellInPage(a.sells[0]);
+        if (ok) { render(); return; }
+      }
+      if (a.deals.length) {
+        // deal for an item on this page? buy in-page instantly
+        const onPage = a.deals.find((d) => findRowAtPrice(d.buyPrice));
+        if (onPage) {
+          const n = await buyInPage(onPage);
+          if (n) { render(); return; }
+        }
+      }
+
+      // 3. otherwise move to a different page (snappy: ~1.4s min)
+      if (now() - bot.lastMove < BOT_MOVE_MS) return;
+      bot.lastMove = now();
+      const links = pageLinks();
+      const fresh = links.filter((l) => (bot.visited[l.href] || 0) < now() - BOT_REVISIT_MS);
+      if (fresh.length) {
+        const target = fresh[rand(0, fresh.length)];
+        bot.visited[target.href] = now();
+        // prune visited map so storage doesn't grow forever
+        for (const k of Object.keys(bot.visited)) if (bot.visited[k] < now() - 10 * 60e3) delete bot.visited[k];
+        saveBot();
+        target.a.click();          // SPA link: usually swaps content, no reload
+        log(`browsing → ${target.href.split('#').pop() || 'market'}`, 'scan');
+      } else if (!location.href.includes('imarket.php')) {
+        location.href = 'https://www.torn.com/imarket.php';  // get to the market
+        log('browsing → item market', 'scan');
+      } else {
+        // everything here was visited recently - clear and re-click oldest
+        const oldest = links.slice().sort((x, y) => (bot.visited[x.href] || 0) - (bot.visited[y.href] || 0))[0];
+        if (oldest) { bot.visited[oldest.href] = now(); saveBot(); oldest.a.click(); }
+      }
+    } catch (e) {
+      log('bot hiccup: ' + e.message, 'warn');
+    } finally {
+      bot.busy = false;
+    }
+  }
+
+  /* ------------------------------------------------------------------
+   * GUI - small, draggable, minimizable
+   * ------------------------------------------------------------------ */
+  let ui = { pos: store.get(KEYS.ui, { px: null, py: null, min: false }) };
+
+  const STYLE = `
+    @keyframes t3-pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(255,71,87,.45);} 50% { box-shadow: 0 0 0 10px rgba(255,71,87,0);} }
+    @keyframes t3-fade { 0% { opacity: 0; transform: translateY(4px);} 100% { opacity: 1; transform: none;} }
+    #t3 { position: fixed; z-index: 99999; width: 300px; right: 18px; bottom: 18px;
+      background: rgba(20,20,28,.94); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+      color: #e8e8ee; border: 1px solid rgba(255,71,87,.35); border-radius: 12px; overflow: hidden;
+      font: 12px/1.5 Arial, sans-serif; box-shadow: 0 14px 40px rgba(0,0,0,.55);
+      transition: opacity .22s ease, transform .22s cubic-bezier(.34,1.56,.64,1); }
+    #t3.min { opacity: 0; transform: translateY(10px) scale(.94); pointer-events: none; }
+    #t3 .head { background: linear-gradient(90deg, rgba(58,13,18,.95), rgba(122,16,32,.95));
+      padding: 8px 12px; cursor: move; display: flex; justify-content: space-between; align-items: center; }
+    #t3 .head b { color: #ff5a5a; font-size: 13px; letter-spacing: .4px; }
+    #t3 .head .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      margin-right: 6px; background: #2ecc71; box-shadow: 0 0 6px #2ecc71; }
+    #t3 .head .dot.off { background: #777; box-shadow: none; }
+    #t3 .head .dot.busy { background: #54a0ff; box-shadow: 0 0 6px #54a0ff; }
+    #t3 .hbtn { background: rgba(255,255,255,.12); color: #fff; border: 0; border-radius: 6px;
+      padding: 3px 9px; cursor: pointer; font-size: 11px; transition: background .15s, transform .15s; }
+    #t3 .hbtn:hover { background: rgba(255,255,255,.24); transform: translateY(-1px); }
+    #t3 .ctl { display: flex; gap: 6px; padding: 10px 12px 4px; align-items: center; }
+    #t3 .bigbtn { flex: 1; border: 0; border-radius: 8px; padding: 8px 0; cursor: pointer;
+      font: bold 12px Arial; color: #fff; transition: transform .15s, box-shadow .15s, opacity .15s; }
+    #t3 .bigbtn:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,.4); }
+    #t3 .bigbtn:disabled { opacity: .35; cursor: default; transform: none; box-shadow: none; }
+    #t3 .on  { background: linear-gradient(180deg,#1f9d55,#146b3a); }
+    #t3 .off { background: linear-gradient(180deg,#96202e,#7a1020); }
+    #t3 .mode { display: flex; gap: 6px; padding: 4px 12px; }
+    #t3 .mode button { flex: 1; background: #26262f; color: #8a8a96; border: 1px solid #33333e;
+      border-radius: 8px; padding: 5px 0; cursor: pointer; font-size: 11px; transition: all .2s; }
+    #t3 .mode button.sel { background: #7a1020; color: #fff; border-color: #ff4757; font-weight: bold; }
+    #t3 .anon { display: flex; align-items: center; gap: 6px; padding: 2px 12px 4px;
+      color: #9999aa; font-size: 10.5px; cursor: pointer; }
+    #t3 .anon input { accent-color: #ff4757; width: 13px; height: 13px; }
+    #t3 .stats { display: flex; justify-content: space-around; padding: 6px 12px;
+      border-top: 1px solid rgba(255,255,255,.06); border-bottom: 1px solid rgba(255,255,255,.06);
+      font-size: 11px; }
+    #t3 .stats div { text-align: center; }
+    #t3 .stats .k { color: #77778a; font-size: 9px; text-transform: uppercase; letter-spacing: .5px; }
+    #t3 .body { padding: 6px 12px; max-height: 190px; overflow-y: auto; }
+    #t3 .body::-webkit-scrollbar { width: 6px; }
+    #t3 .body::-webkit-scrollbar-thumb { background: #33333e; border-radius: 3px; }
+    #t3 .deal { display: flex; align-items: center; gap: 6px; padding: 5px 6px; margin: 3px 0;
+      background: rgba(46,204,113,.07); border: 1px solid rgba(46,204,113,.25); border-radius: 8px;
+      animation: t3-fade .25s ease both; }
+    #t3 .deal.sellrow { background: rgba(255,154,60,.07); border-color: rgba(255,154,60,.3); }
+    #t3 .deal .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #t3 .deal .nm small { color: #8a8a96; display: block; font-size: 9.5px; }
+    #t3 .deal .go { border: 0; border-radius: 6px; padding: 4px 10px; cursor: pointer;
+      font: bold 10.5px Arial; color: #fff; background: linear-gradient(180deg,#1f9d55,#146b3a);
+      transition: transform .12s; flex-shrink: 0; }
+    #t3 .deal .go:hover { transform: scale(1.07); }
+    #t3 .deal .go.sell { background: linear-gradient(180deg,#96202e,#7a1020); }
+    #t3 .pace { padding: 3px 12px; font-size: 10px; color: #54a0ff; }
+    #t3 .log { max-height: 84px; overflow-y: auto; padding: 4px 12px 8px; color: #8fa3c8; font-size: 10px; }
+    #t3 .log .w { color: #ffb0a0; } #t3 .log .t { color: #6fe38a; } #t3 .log .s { color: #54a0ff; }
+    #t3-orb { position: fixed; z-index: 99998; width: 48px; height: 48px; border-radius: 50%;
+      background: radial-gradient(circle at 30% 30%, #ff6b6b, #7a1020 75%); border: 2px solid #ff4757;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      font: bold 12px Arial; color: #fff; user-select: none; animation: t3-pulse 2.4s infinite;
+      box-shadow: 0 4px 18px rgba(122,16,32,.55); transition: transform .2s; }
+    #t3-orb:hover { transform: scale(1.12); }
+  `;
+
+  function buildUI() {
+    if (document.getElementById('t3')) return;
+    const css = document.createElement('style'); css.textContent = STYLE;
+    document.head.appendChild(css);
+
+    const root = document.createElement('div'); root.id = 't3';
+    root.innerHTML = `
+      <div class="head" id="t3-head">
+        <span><span class="dot" id="t3-dot"></span><b>TAST</b> <span id="t3-sub" style="color:#bbb;font-size:10px">off</span></span>
+        <button class="hbtn" id="t3-min">—</button>
+      </div>
+      <div class="ctl">
+        <button class="bigbtn on" id="t3-on">ON</button>
+        <button class="bigbtn off" id="t3-off">OFF</button>
+      </div>
+      <div class="mode">
+        <button id="t3-assisted">ASSISTED</button>
+        <button id="t3-full">FULL AUTO</button>
+      </div>
+      <label class="anon"><input type="checkbox" id="t3-anon"> sell anonymously (+10% fee)</label>
+      <div class="stats">
+        <div><div class="k">cash</div><div id="t3-cash">-</div></div>
+        <div><div class="k">deals</div><div id="t3-deals" style="color:#6fe38a">0</div></div>
+        <div><div class="k">holdings</div><div id="t3-hold">0</div></div>
+        <div><div class="k">P&amp;L</div><div id="t3-pnl" style="color:#6fe38a">$0</div></div>
+      </div>
+      <div class="pace" id="t3-pace"></div>
+      <div class="body" id="t3-body"></div>
+      <div class="log" id="t3-log"></div>`;
+    document.body.appendChild(root);
+
+    const orb = document.createElement('div'); orb.id = 't3-orb'; orb.textContent = 'T';
+    document.body.appendChild(orb);
+
+    root.querySelector('#t3-on').onclick = () => { CFG.on = true; saveConfig(); log('Switched ON - reading pages', 'scan'); render(); };
+    root.querySelector('#t3-off').onclick = () => { CFG.on = false; saveConfig(); log('Switched OFF', 'scan'); render(); };
+    root.querySelector('#t3-assisted').onclick = () => { CFG.mode = 'assisted'; saveConfig(); log('Mode: ASSISTED (you click)', 'scan'); render(); };
+    root.querySelector('#t3-full').onclick = () => { CFG.mode = 'full-auto'; saveConfig();
+      log('Mode: FULL AUTO - browsing + trading by itself. Breaks Torn scripting rules; your call.', 'warn'); render(); };
+    root.querySelector('#t3-anon').onchange = (e) => { CFG.anon = e.target.checked; saveConfig();
+      log(e.target.checked ? 'Anonymous selling ON (+10% fee in math)' : 'Anonymous selling OFF', 'scan'); render(); };
+    root.querySelector('#t3-min').onclick = () => { root.classList.add('min'); ui.pos.min = true; store.set(KEYS.ui, ui.pos); };
+    orb.onclick = () => { root.classList.remove('min'); ui.pos.min = false; store.set(KEYS.ui, ui.pos); render(); };
+
+    const head = root.querySelector('#t3-head');
+    if (ui.pos.px !== null) { root.style.left = ui.pos.px + 'px'; root.style.top = ui.pos.py + 'px'; root.style.right = 'auto'; root.style.bottom = 'auto'; }
+    head.addEventListener('pointerdown', (e) => {
+      if (e.target.tagName === 'BUTTON') return;
+      const r = root.getBoundingClientRect();
+      const ox = e.clientX - r.left, oy = e.clientY - r.top;
+      root.style.right = 'auto'; root.style.bottom = 'auto';
+      const mv = (ev) => {
+        root.style.left = Math.min(Math.max(0, ev.clientX - ox), innerWidth - 60) + 'px';
+        root.style.top = Math.min(Math.max(0, ev.clientY - oy), innerHeight - 30) + 'px';
+      };
+      const up = () => {
+        document.removeEventListener('pointermove', mv); document.removeEventListener('pointerup', up);
+        ui.pos.px = parseInt(root.style.left, 10); ui.pos.py = parseInt(root.style.top, 10);
+        store.set(KEYS.ui, ui.pos);
+      };
+      document.addEventListener('pointermove', mv); document.addEventListener('pointerup', up);
+    });
+
+    if (ui.pos.min) root.classList.add('min');
+    render();
+  }
+
+  let lastAnalysis = null;
+
+  function render() {
+    const root = document.getElementById('t3');
+    if (!root) return;
+    const full = CFG.mode === 'full-auto';
+    const dot = root.querySelector('#t3-dot');
+    dot.classList.toggle('off', !CFG.on);
+    dot.classList.toggle('busy', CFG.on && full);
+    root.querySelector('#t3-sub').textContent = CFG.on ? (full ? '· full auto' : '· assisted') : 'off';
+    root.querySelector('#t3-on').disabled = CFG.on;
+    root.querySelector('#t3-off').disabled = !CFG.on;
+    root.querySelector('#t3-assisted').classList.toggle('sel', !full);
+    root.querySelector('#t3-full').classList.toggle('sel', full);
+    root.querySelector('#t3-anon').checked = !!CFG.anon;
+
+    const pnl = store.get(KEYS.pnl, { total: 0, trades: 0 });
+    const pos = getPositions();
+    const hold = Object.values(pos).reduce((a, p) => a + p.qty, 0);
+
+    lastAnalysis = CFG.on ? analyze(full) : null;
+    const a = lastAnalysis;
+
+    root.querySelector('#t3-cash').textContent = a ? fmt$(a.cash) : '-';
+    root.querySelector('#t3-deals').textContent = a ? a.deals.length + a.sells.length : 0;
+    root.querySelector('#t3-hold').textContent = hold;
+    const pnlEl = root.querySelector('#t3-pnl');
+    pnlEl.textContent = (pnl.total >= 0 ? '+' : '') + fmt$(Math.abs(pnl.total));
+    pnlEl.style.color = pnl.total >= 0 ? '#6fe38a' : '#ff6a6a';
+
+    // pace line (full auto)
+    const pace = root.querySelector('#t3-pace');
+    if (CFG.on && full) {
+      const since = bot.lastTrade ? age(bot.lastTrade) : '-';
+      pace.textContent = `⚡ ${bot.trades} trades this session · last ${since} ago · browsing pages autonomously`;
+    } else if (CFG.on) {
+      pace.textContent = '';
+    } else pace.textContent = '';
+
+    // deals list
+    const body = root.querySelector('#t3-body');
+    if (!CFG.on || !a || (!a.deals.length && !a.sells.length)) {
+      body.innerHTML = CFG.on
+        ? '<div style="color:#77778a;padding:4px 2px">Reading pages… deals appear when an item dips below its average price.</div>'
+        : '<div style="color:#77778a;padding:4px 2px">Off.</div>';
+    } else {
+      body.innerHTML =
+        a.deals.map((d, i) => `
+          <div class="deal">
+            <div class="nm">${esc(d.name)}<small>buy ${d.source} @ ${fmt$(d.buyPrice)} · avg ${fmt$(d.avg)} · -${d.dipPct.toFixed(1)}% · ~${fmt$(d.profit)}/ea</small></div>
+            ${full ? '' : `<button class="go" data-buy="${i}">BUY</button>`}
+          </div>`).join('') +
+        a.sells.map((s, i) => `
+          <div class="deal sellrow">
+            <div class="nm">${esc(s.name)}<small>hold ${s.qty} @ ${fmt$(s.avgCost)} · now ${fmt$(s.price)} · +${s.gainPct.toFixed(1)}%</small></div>
+            ${full ? '' : `<button class="go sell" data-sell="${i}">SELL</button>`}
+          </div>`).join('');
+      body.querySelectorAll('[data-buy]').forEach((b) =>
+        b.onclick = () => actBuy(a.deals[Number(b.dataset.buy)]));
+      body.querySelectorAll('[data-sell]').forEach((b) =>
+        b.onclick = () => actSell(a.sells[Number(b.dataset.sell)]));
+    }
+
+    renderLog();
+  }
+
+  function renderLog() {
+    const el = document.getElementById('t3-log');
+    if (!el) return;
+    el.innerHTML = LOG.slice(0, 12).map((l) =>
+      `<div class="${l.kind === 'warn' ? 'w' : l.kind === 'trade' ? 't' : l.kind === 'scan' ? 's' : ''}">` +
+      `[${new Date(l.t).toLocaleTimeString()}] ${esc(l.msg)}</div>`).join('') ||
+      '<div style="color:#555">no activity yet</div>';
+  }
+
+  /* ------------------------------------------------------------------
+   * Init + loops
+   * ------------------------------------------------------------------ */
+  function start() {
+    buildUI();
+    log('TAST v3.1 loaded - ON/OFF + mode selector.', 'scan');
+
+    // instant harvest whenever the page content changes
+    let harvestTimer = null;
+    try {
+      const obs = new MutationObserver(() => {
+        if (!CFG.on) return;
+        clearTimeout(harvestTimer);
+        harvestTimer = setTimeout(harvestPage, 200);
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+    } catch {}
+
+    // the bot brain: fast tick
+    setInterval(() => { botTick().then(() => render()); }, BOT_TICK_MS);
+
+    // assisted-mode refresh + pace line update
+    setInterval(() => {
+      if (CFG.on && CFG.mode !== 'full-auto') render();
+      else if (CFG.on) render(); // keep pace line fresh
+    }, 1500);
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
+  else start();
+})();
