@@ -1,0 +1,4775 @@
+// ==UserScript==
+// @name          ♟Super-chess-Bot
+// @namespace     http://tampermonkey.net/
+// @version       9.1.0
+// @description   Super chess Bot is a tournament level bullet bot
+// @author        quantavil
+// @match         https://www.chess.com/play/computer*
+// @match         https://www.chess.com/game/*
+// @match         https://www.chess.com/play/online*
+// @license       MIT
+// @icon          https://www.google.com/s2/favicons?sz=64&domain=chess.com
+// @antifeature   membership
+// @downloadURL https://update.greasyfork.org/scripts/551512/%E2%99%9FSuper-chess-Bot.user.js
+// @updateURL https://update.greasyfork.org/scripts/551512/%E2%99%9FSuper-chess-Bot.meta.js
+// ==/UserScript==
+
+
+(() => {
+  var __defProp = Object.defineProperty;
+  var __getOwnPropNames = Object.getOwnPropertyNames;
+  var __esm = (fn, res) => function __init() {
+    return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+  };
+  var __export = (target, all) => {
+    for (var name in all)
+      __defProp(target, name, { get: all[name], enumerable: true });
+  };
+
+  // src/utils.js
+  function debounce(fn, wait = 150) {
+    let t = null;
+    return (...args) => {
+      clearTimeout(t);
+      t = setTimeout(() => fn(...args), wait);
+    };
+  }
+  async function waitForElement(selector, timeout = 15e3) {
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector(selector);
+      if (existing)
+        return resolve(existing);
+      let timeoutId;
+      const obs = new MutationObserver(() => {
+        const el = document.querySelector(selector);
+        if (el) {
+          clearTimeout(timeoutId);
+          obs.disconnect();
+          resolve(el);
+        }
+      });
+      obs.observe(document.body, { childList: true, subtree: true });
+      timeoutId = setTimeout(() => {
+        obs.disconnect();
+        reject(new Error(`Element ${selector} not found within ${timeout}ms`));
+      }, timeout);
+    });
+  }
+  function scoreFrom(obj) {
+    if (!obj)
+      return {};
+    if (typeof obj === "object") {
+      if ("mate" in obj && obj.mate !== 0)
+        return { mate: parseInt(obj.mate, 10) };
+      if ("cp" in obj)
+        return { cp: parseInt(obj.cp, 10) };
+    }
+    if (typeof obj === "string") {
+      if (obj.toUpperCase().includes("M")) {
+        const m = parseInt(obj.replace(/[^-0-9]/g, ""), 10);
+        if (!isNaN(m))
+          return { mate: m };
+      }
+      const cpFloat = parseFloat(obj);
+      if (!isNaN(cpFloat))
+        return { cp: Math.round(cpFloat * 100) };
+    }
+    if (typeof obj === "number")
+      return { cp: Math.round(obj * 100) };
+    return {};
+  }
+  function scoreToDisplay(score) {
+    if (score && typeof score.mate === "number" && score.mate !== 0)
+      return `M${score.mate}`;
+    if (score && typeof score.cp === "number")
+      return (score.cp / 100).toFixed(2);
+    return "-";
+  }
+  function scoreNumeric(s) {
+    if (!s)
+      return -Infinity;
+    if (typeof s.mate === "number")
+      return s.mate > 0 ? 1e5 - s.mate : -1e5 - s.mate;
+    if (typeof s.cp === "number")
+      return s.cp;
+    return -Infinity;
+  }
+  var sleep;
+  var init_utils = __esm({
+    "src/utils.js"() {
+      sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    }
+  });
+
+  // src/config.js
+  var GAME_CACHE_TTL;
+  var init_config = __esm({
+    "src/config.js"() {
+      GAME_CACHE_TTL = 100;
+    }
+  });
+
+  // src/state.js
+  function isBoardFlipped() {
+    const now = Date.now();
+    if (now - cachedFlipTimestamp < 1e3)
+      return cachedBoardFlipped;
+    const el = getBoard();
+    let flipped = false;
+    try {
+      const attr = el?.getAttribute?.("orientation");
+      if (attr === "black")
+        flipped = true;
+      else if (attr === "white")
+        flipped = false;
+      else if (el?.classList?.contains("flipped"))
+        flipped = true;
+      else if (getGame()?.getPlayingAs?.() === 2)
+        flipped = true;
+    } catch {
+    }
+    cachedBoardFlipped = flipped;
+    cachedFlipTimestamp = now;
+    return flipped;
+  }
+  function invalidateGameCache() {
+    cachedGame = null;
+    cachedGameTimestamp = 0;
+  }
+  var BotState, LRUCache, PositionCache, Settings, cachedGame, cachedGameTimestamp, cachedBoardFlipped, cachedFlipTimestamp, getBoard, getGame, getFen, getPlayerColor, getSideToMove, isPlayersTurn, pa;
+  var init_state = __esm({
+    "src/state.js"() {
+      init_utils();
+      init_config();
+      BotState = {
+        hackEnabled: 0,
+        botPower: 12,
+        // Depth (default 12)
+        moveTime: 1e3,
+        // Max Think Time (ms)
+        autoMove: 1,
+        currentEvaluation: "-",
+        bestMove: "-",
+        principalVariation: "-",
+        statusInfo: "Ready",
+        premoveEnabled: 0,
+        autoRematch: 0,
+        moveMethod: "click",
+        // 'click' or 'drag'
+        jitter: 0
+        // Random delay (ms)
+      };
+      LRUCache = class {
+        constructor(limit = 2e3) {
+          this.limit = limit;
+          this.cache = /* @__PURE__ */ new Map();
+        }
+        get(key) {
+          if (!this.cache.has(key))
+            return void 0;
+          const val = this.cache.get(key);
+          this.cache.delete(key);
+          this.cache.set(key, val);
+          return val;
+        }
+        set(key, value) {
+          if (this.cache.has(key))
+            this.cache.delete(key);
+          else if (this.cache.size >= this.limit) {
+            this.cache.delete(this.cache.keys().next().value);
+          }
+          this.cache.set(key, value);
+        }
+        clear() {
+          this.cache.clear();
+        }
+      };
+      PositionCache = new LRUCache(2e3);
+      Settings = {
+        save: debounce(() => {
+          try {
+            const menuWrap = document.querySelector("#menuWrap");
+            const settings = {
+              hackEnabled: BotState.hackEnabled,
+              botPower: BotState.botPower,
+              moveTime: BotState.moveTime,
+              autoMove: BotState.autoMove,
+              premoveEnabled: BotState.premoveEnabled,
+              autoRematch: BotState.autoRematch,
+              moveMethod: BotState.moveMethod,
+              jitter: BotState.jitter,
+              menuPosition: menuWrap ? { top: menuWrap.style.top, left: menuWrap.style.left } : null
+            };
+            localStorage.setItem("gabibot_settings", JSON.stringify(settings));
+          } catch (e) {
+            console.warn("Failed to save settings:", e);
+          }
+        }, 200),
+        load() {
+          try {
+            const saved = localStorage.getItem("gabibot_settings");
+            if (!saved)
+              return null;
+            const s = JSON.parse(saved);
+            BotState.hackEnabled = s.hackEnabled ?? 0;
+            BotState.botPower = s.botPower ?? 12;
+            BotState.moveTime = s.moveTime ?? 1e3;
+            BotState.autoMove = s.autoMove ?? 1;
+            BotState.premoveEnabled = s.premoveEnabled ?? 0;
+            BotState.autoRematch = s.autoRematch ?? 0;
+            BotState.moveMethod = s.moveMethod ?? "click";
+            BotState.jitter = s.jitter ?? 0;
+            return s;
+          } catch (e) {
+            console.error("Failed to load settings:", e);
+            return null;
+          }
+        }
+      };
+      cachedGame = null;
+      cachedGameTimestamp = 0;
+      cachedBoardFlipped = false;
+      cachedFlipTimestamp = 0;
+      getBoard = () => document.querySelector("chess-board") || document.querySelector(".board") || document.querySelector('[class*="board"]');
+      getGame = () => {
+        const now = Date.now();
+        if (cachedGame && now - cachedGameTimestamp < GAME_CACHE_TTL) {
+          return cachedGame;
+        }
+        cachedGame = getBoard()?.game || null;
+        cachedGameTimestamp = now;
+        return cachedGame;
+      };
+      getFen = (g) => {
+        try {
+          return g?.getFEN ? g.getFEN() : null;
+        } catch {
+          return null;
+        }
+      };
+      getPlayerColor = (g) => {
+        try {
+          const v = g?.getPlayingAs?.();
+          return v === 2 ? "b" : "w";
+        } catch {
+          return "w";
+        }
+      };
+      getSideToMove = (g) => {
+        const fen = getFen(g);
+        return fen ? fen.split(" ")[1] || null : null;
+      };
+      isPlayersTurn = (g) => {
+        const me = getPlayerColor(g), stm = getSideToMove(g);
+        return !!me && !!stm && me === stm;
+      };
+      pa = () => getGame()?.getPlayingAs ? getGame().getPlayingAs() : 1;
+    }
+  });
+
+  // src/engine/constants.js
+  var WP, WN, WB, WR, WQ, WK, BP, BN, BB, BR, BQ, BK, EMPTY, FLAG_NONE, FLAG_EP, FLAG_CASTLE, FLAG_PROMO, MATE_SCORE, KNIGHT_OFFSETS, STRAIGHT_DIRS, DIAG_DIRS, ALL_DIRS, PHASE_VAL, ATTACK_WEIGHT, TT_EXACT, TT_ALPHA, TT_BETA, TT_SIZE, PIECE_VAL;
+  var init_constants = __esm({
+    "src/engine/constants.js"() {
+      WP = 1;
+      WN = 2;
+      WB = 3;
+      WR = 4;
+      WQ = 5;
+      WK = 6;
+      BP = -1;
+      BN = -2;
+      BB = -3;
+      BR = -4;
+      BQ = -5;
+      BK = -6;
+      EMPTY = 0;
+      FLAG_NONE = 0;
+      FLAG_EP = 1;
+      FLAG_CASTLE = 2;
+      FLAG_PROMO = 4;
+      MATE_SCORE = 3e4;
+      KNIGHT_OFFSETS = [-33, -31, -18, -14, 14, 18, 31, 33];
+      STRAIGHT_DIRS = [16, -16, 1, -1];
+      DIAG_DIRS = [17, 15, -15, -17];
+      ALL_DIRS = [17, 15, -15, -17, 16, -16, 1, -1];
+      PHASE_VAL = [0, 0, 1, 1, 2, 4];
+      ATTACK_WEIGHT = [0, 0, 20, 20, 40, 80];
+      TT_EXACT = 0;
+      TT_ALPHA = 1;
+      TT_BETA = 2;
+      TT_SIZE = 65536;
+      PIECE_VAL = { 1: 82, 2: 337, 3: 365, 4: 477, 5: 1025, 6: 2e4 };
+    }
+  });
+
+  // src/engine/pst.js
+  function to0x88(pst64) {
+    const pst128 = new Int16Array(128).fill(0);
+    for (let r = 0; r < 8; r++) {
+      for (let f = 0; f < 8; f++) {
+        pst128[r * 16 + f] = pst64[r * 8 + f];
+      }
+    }
+    return pst128;
+  }
+  var RAW_PST_PAWN_MG, RAW_PST_KNIGHT_MG, RAW_PST_BISHOP_MG, RAW_PST_ROOK_MG, RAW_PST_QUEEN_MG, RAW_PST_KING_MG, RAW_PST_PAWN_EG, RAW_PST_KNIGHT_EG, RAW_PST_BISHOP_EG, RAW_PST_ROOK_EG, RAW_PST_QUEEN_EG, RAW_PST_KING_EG, PST_PAWN_MG, PST_KNIGHT_MG, PST_BISHOP_MG, PST_ROOK_MG, PST_QUEEN_MG, PST_KING_MG, PST_PAWN_EG, PST_KNIGHT_EG, PST_BISHOP_EG, PST_ROOK_EG, PST_QUEEN_EG, PST_KING_EG, PST_MG, PST_EG, MAT_MG, MAT_EG;
+  var init_pst = __esm({
+    "src/engine/pst.js"() {
+      RAW_PST_PAWN_MG = [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        -35,
+        -1,
+        -20,
+        -23,
+        -15,
+        24,
+        38,
+        -22,
+        -26,
+        -4,
+        -4,
+        -10,
+        3,
+        3,
+        33,
+        -12,
+        -27,
+        -2,
+        -5,
+        12,
+        17,
+        6,
+        10,
+        -25,
+        -14,
+        13,
+        6,
+        21,
+        23,
+        12,
+        17,
+        -23,
+        -6,
+        7,
+        26,
+        31,
+        65,
+        56,
+        25,
+        -20,
+        98,
+        134,
+        61,
+        95,
+        68,
+        126,
+        34,
+        -11,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ];
+      RAW_PST_KNIGHT_MG = [
+        -105,
+        -21,
+        -58,
+        -33,
+        -17,
+        -28,
+        -19,
+        -23,
+        -29,
+        -53,
+        -12,
+        -3,
+        -1,
+        18,
+        -14,
+        -19,
+        -23,
+        -9,
+        12,
+        10,
+        19,
+        17,
+        25,
+        -16,
+        -13,
+        4,
+        16,
+        13,
+        28,
+        19,
+        21,
+        -8,
+        -9,
+        17,
+        19,
+        53,
+        37,
+        69,
+        18,
+        22,
+        -47,
+        60,
+        37,
+        65,
+        84,
+        129,
+        73,
+        44,
+        -73,
+        -41,
+        72,
+        36,
+        23,
+        62,
+        7,
+        -17,
+        -167,
+        -89,
+        -34,
+        -49,
+        61,
+        -97,
+        -15,
+        -107
+      ];
+      RAW_PST_BISHOP_MG = [
+        -33,
+        -3,
+        -14,
+        -21,
+        -13,
+        -12,
+        -39,
+        -21,
+        4,
+        15,
+        16,
+        0,
+        7,
+        21,
+        33,
+        1,
+        0,
+        15,
+        15,
+        15,
+        14,
+        27,
+        18,
+        10,
+        -6,
+        13,
+        13,
+        26,
+        34,
+        12,
+        10,
+        4,
+        -4,
+        5,
+        19,
+        50,
+        37,
+        37,
+        7,
+        -2,
+        -16,
+        37,
+        43,
+        40,
+        35,
+        50,
+        37,
+        -2,
+        -26,
+        16,
+        -18,
+        -13,
+        30,
+        59,
+        18,
+        -47,
+        -29,
+        4,
+        -82,
+        -37,
+        -25,
+        -42,
+        7,
+        -8
+      ];
+      RAW_PST_ROOK_MG = [
+        -19,
+        -13,
+        1,
+        17,
+        16,
+        7,
+        -37,
+        -26,
+        -44,
+        -16,
+        -20,
+        -9,
+        -1,
+        11,
+        -6,
+        -71,
+        -45,
+        -25,
+        -16,
+        -17,
+        3,
+        0,
+        -5,
+        -33,
+        -36,
+        -26,
+        -12,
+        -1,
+        9,
+        -7,
+        6,
+        -23,
+        -24,
+        -11,
+        7,
+        26,
+        24,
+        35,
+        -8,
+        -20,
+        -5,
+        19,
+        26,
+        36,
+        17,
+        45,
+        61,
+        16,
+        27,
+        32,
+        58,
+        62,
+        80,
+        67,
+        26,
+        44,
+        32,
+        42,
+        32,
+        51,
+        63,
+        9,
+        31,
+        43
+      ];
+      RAW_PST_QUEEN_MG = [
+        -1,
+        -18,
+        -9,
+        10,
+        -15,
+        -25,
+        -31,
+        -50,
+        -35,
+        -8,
+        11,
+        2,
+        8,
+        15,
+        -3,
+        1,
+        -14,
+        2,
+        -11,
+        -2,
+        -5,
+        2,
+        14,
+        5,
+        -9,
+        -26,
+        -9,
+        -10,
+        -2,
+        -4,
+        3,
+        -3,
+        -27,
+        -27,
+        -16,
+        -16,
+        -1,
+        17,
+        -2,
+        1,
+        -13,
+        -17,
+        7,
+        8,
+        29,
+        56,
+        47,
+        57,
+        -24,
+        -39,
+        -5,
+        1,
+        -16,
+        57,
+        28,
+        54,
+        -28,
+        0,
+        29,
+        12,
+        59,
+        44,
+        43,
+        45
+      ];
+      RAW_PST_KING_MG = [
+        -15,
+        36,
+        12,
+        -54,
+        8,
+        -28,
+        24,
+        14,
+        1,
+        7,
+        -8,
+        -64,
+        -43,
+        -16,
+        9,
+        8,
+        -14,
+        -14,
+        -22,
+        -46,
+        -44,
+        -30,
+        -15,
+        -27,
+        -49,
+        -1,
+        -27,
+        -39,
+        -46,
+        -44,
+        -33,
+        -51,
+        -17,
+        -20,
+        -12,
+        -27,
+        -30,
+        -25,
+        -14,
+        -36,
+        -9,
+        24,
+        2,
+        -16,
+        -20,
+        6,
+        22,
+        -22,
+        29,
+        -1,
+        -20,
+        -7,
+        -8,
+        -4,
+        -38,
+        -29,
+        -65,
+        23,
+        16,
+        -15,
+        -56,
+        -34,
+        2,
+        13
+      ];
+      RAW_PST_PAWN_EG = [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        13,
+        8,
+        8,
+        10,
+        13,
+        0,
+        2,
+        -7,
+        4,
+        7,
+        -6,
+        1,
+        0,
+        -5,
+        -1,
+        -8,
+        13,
+        9,
+        -3,
+        -7,
+        -7,
+        -8,
+        3,
+        -1,
+        32,
+        24,
+        13,
+        5,
+        -2,
+        4,
+        17,
+        17,
+        94,
+        100,
+        85,
+        67,
+        56,
+        53,
+        82,
+        84,
+        178,
+        173,
+        158,
+        134,
+        147,
+        132,
+        165,
+        187,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ];
+      RAW_PST_KNIGHT_EG = [
+        -29,
+        -51,
+        -23,
+        -15,
+        -22,
+        -18,
+        -50,
+        -64,
+        -42,
+        -20,
+        -10,
+        -5,
+        -2,
+        -20,
+        -23,
+        -44,
+        -23,
+        -3,
+        -1,
+        15,
+        10,
+        -3,
+        -20,
+        -22,
+        -18,
+        -6,
+        16,
+        25,
+        16,
+        17,
+        4,
+        -18,
+        -17,
+        3,
+        22,
+        22,
+        22,
+        11,
+        8,
+        -18,
+        -24,
+        -20,
+        10,
+        9,
+        -1,
+        -9,
+        -19,
+        -41,
+        -25,
+        -8,
+        -25,
+        -2,
+        -9,
+        -25,
+        -24,
+        -52,
+        -58,
+        -38,
+        -13,
+        -28,
+        -31,
+        -27,
+        -63,
+        -99
+      ];
+      RAW_PST_BISHOP_EG = [
+        -23,
+        -9,
+        -23,
+        -5,
+        -9,
+        -16,
+        -5,
+        -17,
+        -14,
+        -18,
+        -7,
+        -1,
+        4,
+        -9,
+        -15,
+        -27,
+        -12,
+        -3,
+        8,
+        10,
+        13,
+        3,
+        -7,
+        -15,
+        -6,
+        3,
+        13,
+        19,
+        7,
+        10,
+        -3,
+        -9,
+        -3,
+        9,
+        12,
+        9,
+        14,
+        10,
+        3,
+        2,
+        2,
+        -8,
+        0,
+        -1,
+        -2,
+        6,
+        0,
+        4,
+        -8,
+        -4,
+        7,
+        -12,
+        -3,
+        -13,
+        -4,
+        -14,
+        -14,
+        -21,
+        -11,
+        -8,
+        -7,
+        -9,
+        -17,
+        -24
+      ];
+      RAW_PST_ROOK_EG = [
+        -9,
+        2,
+        3,
+        -1,
+        -5,
+        -13,
+        4,
+        -20,
+        -6,
+        -6,
+        0,
+        2,
+        -9,
+        -9,
+        -11,
+        -3,
+        -4,
+        0,
+        -5,
+        -1,
+        -7,
+        -12,
+        -8,
+        -16,
+        3,
+        5,
+        8,
+        4,
+        -5,
+        -6,
+        -8,
+        -11,
+        4,
+        3,
+        13,
+        1,
+        2,
+        1,
+        -1,
+        2,
+        7,
+        7,
+        7,
+        5,
+        4,
+        -3,
+        -5,
+        -3,
+        11,
+        13,
+        13,
+        11,
+        -3,
+        3,
+        8,
+        3,
+        13,
+        10,
+        18,
+        15,
+        12,
+        12,
+        8,
+        5
+      ];
+      RAW_PST_QUEEN_EG = [
+        -33,
+        -28,
+        -22,
+        -43,
+        -5,
+        -32,
+        -20,
+        -41,
+        -22,
+        -23,
+        -30,
+        -16,
+        -16,
+        -23,
+        -36,
+        -32,
+        -16,
+        -27,
+        15,
+        6,
+        9,
+        17,
+        10,
+        5,
+        -18,
+        28,
+        19,
+        47,
+        31,
+        34,
+        39,
+        23,
+        3,
+        22,
+        24,
+        45,
+        57,
+        40,
+        57,
+        36,
+        -20,
+        6,
+        9,
+        49,
+        47,
+        35,
+        19,
+        9,
+        -17,
+        20,
+        32,
+        41,
+        58,
+        25,
+        30,
+        0,
+        -9,
+        22,
+        22,
+        27,
+        27,
+        19,
+        10,
+        20
+      ];
+      RAW_PST_KING_EG = [
+        -53,
+        -34,
+        -21,
+        -11,
+        -28,
+        -14,
+        -24,
+        -43,
+        -27,
+        -11,
+        4,
+        13,
+        14,
+        4,
+        -5,
+        -17,
+        -19,
+        -3,
+        11,
+        21,
+        23,
+        16,
+        7,
+        -9,
+        -18,
+        -4,
+        21,
+        24,
+        27,
+        23,
+        9,
+        -11,
+        -8,
+        22,
+        24,
+        27,
+        26,
+        33,
+        26,
+        3,
+        10,
+        17,
+        23,
+        15,
+        20,
+        45,
+        44,
+        13,
+        -12,
+        17,
+        14,
+        17,
+        17,
+        38,
+        23,
+        11,
+        -74,
+        -35,
+        -18,
+        -18,
+        -11,
+        15,
+        4,
+        -17
+      ];
+      PST_PAWN_MG = to0x88(RAW_PST_PAWN_MG);
+      PST_KNIGHT_MG = to0x88(RAW_PST_KNIGHT_MG);
+      PST_BISHOP_MG = to0x88(RAW_PST_BISHOP_MG);
+      PST_ROOK_MG = to0x88(RAW_PST_ROOK_MG);
+      PST_QUEEN_MG = to0x88(RAW_PST_QUEEN_MG);
+      PST_KING_MG = to0x88(RAW_PST_KING_MG);
+      PST_PAWN_EG = to0x88(RAW_PST_PAWN_EG);
+      PST_KNIGHT_EG = to0x88(RAW_PST_KNIGHT_EG);
+      PST_BISHOP_EG = to0x88(RAW_PST_BISHOP_EG);
+      PST_ROOK_EG = to0x88(RAW_PST_ROOK_EG);
+      PST_QUEEN_EG = to0x88(RAW_PST_QUEEN_EG);
+      PST_KING_EG = to0x88(RAW_PST_KING_EG);
+      PST_MG = [null, PST_PAWN_MG, PST_KNIGHT_MG, PST_BISHOP_MG, PST_ROOK_MG, PST_QUEEN_MG, PST_KING_MG];
+      PST_EG = [null, PST_PAWN_EG, PST_KNIGHT_EG, PST_BISHOP_EG, PST_ROOK_EG, PST_QUEEN_EG, PST_KING_EG];
+      MAT_MG = [0, 82, 337, 365, 477, 1025, 0];
+      MAT_EG = [0, 94, 281, 297, 512, 936, 0];
+    }
+  });
+
+  // src/engine/zobrist.js
+  function zobPieceIdx(piece) {
+    return piece > 0 ? piece - 1 : -piece + 5;
+  }
+  function zobPieceKey(piece, sq) {
+    const base = (zobPieceIdx(piece) * 128 + sq) * 2;
+    return [ZOBRIST.table[base], ZOBRIST.table[base + 1]];
+  }
+  function zobXor(hash, key) {
+    hash[0] ^= key[0];
+    hash[1] ^= key[1];
+  }
+  var ZOBRIST;
+  var init_zobrist = __esm({
+    "src/engine/zobrist.js"() {
+      ZOBRIST = (() => {
+        let seed = 1070372;
+        const rand32 = () => {
+          seed ^= seed << 13;
+          seed ^= seed >> 17;
+          seed ^= seed << 5;
+          return seed >>> 0;
+        };
+        const table = new Uint32Array(13 * 128 * 2);
+        for (let i = 0; i < table.length; i++)
+          table[i] = rand32();
+        const sideKey = [rand32(), rand32()];
+        const castlingKeys = new Uint32Array(16 * 2);
+        for (let i = 0; i < castlingKeys.length; i++)
+          castlingKeys[i] = rand32();
+        const epKeys = new Uint32Array(8 * 2);
+        for (let i = 0; i < epKeys.length; i++)
+          epKeys[i] = rand32();
+        return { table, sideKey, castlingKeys, epKeys };
+      })();
+    }
+  });
+
+  // src/engine/utils.js
+  function sqFile(sq) {
+    return sq & 7;
+  }
+  function sqRank(sq) {
+    return sq >> 4;
+  }
+  function sqName(sq) {
+    return "abcdefgh"[sqFile(sq)] + (sqRank(sq) + 1);
+  }
+  function nameToSq(s) {
+    return s.charCodeAt(0) - 97 + (s.charCodeAt(1) - 49) * 16;
+  }
+  var init_utils2 = __esm({
+    "src/engine/utils.js"() {
+    }
+  });
+
+  // src/engine/search.js
+  var SearchMethods;
+  var init_search = __esm({
+    "src/engine/search.js"() {
+      init_constants();
+      init_pst();
+      init_zobrist();
+      init_utils2();
+      SearchMethods = {
+        // ---- Evaluation ----
+        clearTT() {
+          for (let i = 0; i < this.tt.length; i++) {
+            this.tt[i] = void 0;
+          }
+        },
+        evaluate() {
+          let mgScore = this.mgPstMat, egScore = this.egPstMat;
+          const bd = this.board;
+          const {
+            wPawnFiles,
+            bPawnFiles,
+            wPawnRanks,
+            bPawnRanks,
+            bPawnMaxRanks,
+            wPawnMinRanks,
+            rookSquares,
+            rookSides
+          } = this.evalBufs;
+          wPawnFiles.fill(0);
+          bPawnFiles.fill(0);
+          wPawnRanks.fill(-1);
+          bPawnRanks.fill(8);
+          bPawnMaxRanks.fill(-1);
+          wPawnMinRanks.fill(8);
+          let rookCount = 0;
+          let wKingAttackers = 0, bKingAttackers = 0;
+          let wKingAttackWeight = 0, bKingAttackWeight = 0;
+          const wKingSq = this.wKingSq, bKingSq = this.bKingSq;
+          const wkf = wKingSq & 7, wkr = wKingSq >> 4;
+          const bkf = bKingSq & 7, bkr = bKingSq >> 4;
+          for (let sq = 0; sq < 128; sq++) {
+            if (sq & 136) {
+              sq += 7;
+              continue;
+            }
+            const p = bd[sq];
+            if (p === EMPTY)
+              continue;
+            const side = p > 0 ? 1 : -1;
+            const abs = p > 0 ? p : -p;
+            const file = sq & 7, rank = sq >> 4;
+            if (abs === 1) {
+              if (side === 1) {
+                wPawnFiles[file]++;
+                if (rank > wPawnRanks[file])
+                  wPawnRanks[file] = rank;
+                if (rank < wPawnMinRanks[file])
+                  wPawnMinRanks[file] = rank;
+              } else {
+                bPawnFiles[file]++;
+                if (rank < bPawnRanks[file])
+                  bPawnRanks[file] = rank;
+                if (rank > bPawnMaxRanks[file])
+                  bPawnMaxRanks[file] = rank;
+              }
+            }
+            if (abs === 4) {
+              if (rookCount < 4) {
+                rookSquares[rookCount] = sq;
+                rookSides[rookCount] = side;
+                rookCount++;
+              }
+            }
+            if (abs === 2) {
+              let mob = 0;
+              for (let i = 0; i < 8; i++) {
+                const t = sq + KNIGHT_OFFSETS[i];
+                if (t & 136)
+                  continue;
+                const df = (t & 7) - file;
+                if (df > 2 || df < -2)
+                  continue;
+                const tp = bd[t];
+                if (tp === EMPTY || (tp > 0 ? 1 : -1) !== side)
+                  mob++;
+              }
+              mgScore += (mob - 4) * 4 * side;
+              egScore += (mob - 4) * 4 * side;
+            } else if (abs === 3) {
+              let mob = 0;
+              for (let di = 0; di < 4; di++) {
+                const dir = DIAG_DIRS[di];
+                let t = sq + dir;
+                while (!(t & 136)) {
+                  const tp = bd[t];
+                  if (tp !== EMPTY && (tp > 0 ? 1 : -1) === side)
+                    break;
+                  mob++;
+                  if (tp !== EMPTY)
+                    break;
+                  t += dir;
+                }
+              }
+              mgScore += (mob - 5) * 5 * side;
+              egScore += (mob - 5) * 5 * side;
+            } else if (abs === 4) {
+              let mob = 0;
+              for (let di = 0; di < 4; di++) {
+                const dir = STRAIGHT_DIRS[di];
+                let t = sq + dir;
+                while (!(t & 136)) {
+                  const tp = bd[t];
+                  if (tp !== EMPTY && (tp > 0 ? 1 : -1) === side)
+                    break;
+                  mob++;
+                  if (tp !== EMPTY)
+                    break;
+                  t += dir;
+                }
+              }
+              mgScore += (mob - 7) * 3 * side;
+              egScore += (mob - 7) * 4 * side;
+            } else if (abs === 5) {
+              let mob = 0;
+              for (let di = 0; di < 8; di++) {
+                const dir = ALL_DIRS[di];
+                let t = sq + dir;
+                while (!(t & 136)) {
+                  const tp = bd[t];
+                  if (tp !== EMPTY && (tp > 0 ? 1 : -1) === side)
+                    break;
+                  mob++;
+                  if (tp !== EMPTY)
+                    break;
+                  t += dir;
+                }
+              }
+              mgScore += (mob - 14) * 1 * side;
+              egScore += (mob - 14) * 2 * side;
+            }
+            if (abs >= 2 && abs <= 5) {
+              if (side === 1) {
+                const df = file - bkf;
+                const adf = df > 0 ? df : -df;
+                const dr = rank - bkr;
+                const adr = dr > 0 ? dr : -dr;
+                if (adf <= 2 && adr <= 2) {
+                  wKingAttackers++;
+                  wKingAttackWeight += ATTACK_WEIGHT[abs];
+                }
+              } else {
+                const df = file - wkf;
+                const adf = df > 0 ? df : -df;
+                const dr = rank - wkr;
+                const adr = dr > 0 ? dr : -dr;
+                if (adf <= 2 && adr <= 2) {
+                  bKingAttackers++;
+                  bKingAttackWeight += ATTACK_WEIGHT[abs];
+                }
+              }
+            }
+          }
+          if (this.wBishops >= 2) {
+            mgScore += 30;
+            egScore += 50;
+          }
+          if (this.bBishops >= 2) {
+            mgScore -= 30;
+            egScore -= 50;
+          }
+          for (let f = 0; f < 8; f++) {
+            if (wPawnFiles[f] > 1) {
+              mgScore -= 10 * (wPawnFiles[f] - 1);
+              egScore -= 20 * (wPawnFiles[f] - 1);
+            }
+            if (bPawnFiles[f] > 1) {
+              mgScore += 10 * (bPawnFiles[f] - 1);
+              egScore += 20 * (bPawnFiles[f] - 1);
+            }
+            if (wPawnFiles[f] > 0) {
+              const hasNeighbor = f > 0 && wPawnFiles[f - 1] > 0 || f < 7 && wPawnFiles[f + 1] > 0;
+              if (!hasNeighbor) {
+                mgScore -= 15;
+                egScore -= 20;
+              }
+            }
+            if (bPawnFiles[f] > 0) {
+              const hasNeighbor = f > 0 && bPawnFiles[f - 1] > 0 || f < 7 && bPawnFiles[f + 1] > 0;
+              if (!hasNeighbor) {
+                mgScore += 15;
+                egScore += 20;
+              }
+            }
+            if (wPawnRanks[f] >= 0) {
+              let passed = true;
+              const fmin = f > 0 ? f - 1 : 0, fmax = f < 7 ? f + 1 : 7;
+              for (let ff = fmin; ff <= fmax; ff++) {
+                if (bPawnMaxRanks[ff] > wPawnRanks[f]) {
+                  passed = false;
+                  break;
+                }
+              }
+              if (passed) {
+                const advance = wPawnRanks[f];
+                const bonus = [0, 10, 30, 80, 160, 300, 800][advance] || 0;
+                mgScore += bonus / 2;
+                egScore += bonus;
+              }
+            }
+            if (bPawnRanks[f] < 8) {
+              let passed = true;
+              const fmin = f > 0 ? f - 1 : 0, fmax = f < 7 ? f + 1 : 7;
+              for (let ff = fmin; ff <= fmax; ff++) {
+                if (wPawnMinRanks[ff] < bPawnRanks[f]) {
+                  passed = false;
+                  break;
+                }
+              }
+              if (passed) {
+                const advance = 7 - bPawnRanks[f];
+                const bonus = [0, 10, 30, 80, 160, 300, 800][advance] || 0;
+                mgScore -= bonus / 2;
+                egScore -= bonus;
+              }
+            }
+          }
+          for (let i = 0; i < rookCount; i++) {
+            const f = rookSquares[i] & 7;
+            const side = rookSides[i];
+            const hasFriendlyPawn = side === 1 ? wPawnFiles[f] > 0 : bPawnFiles[f] > 0;
+            const hasEnemyPawn = side === 1 ? bPawnFiles[f] > 0 : wPawnFiles[f] > 0;
+            if (!hasFriendlyPawn && !hasEnemyPawn) {
+              mgScore += 20 * side;
+              egScore += 20 * side;
+            } else if (!hasFriendlyPawn) {
+              mgScore += 10 * side;
+              egScore += 10 * side;
+            }
+          }
+          for (let si = 0; si < 2; si++) {
+            const side = si === 0 ? 1 : -1;
+            const ksq = side === 1 ? wKingSq : bKingSq;
+            if (ksq < 0)
+              continue;
+            const kf = ksq & 7;
+            const kr = ksq >> 4;
+            const shieldRank = kr + side;
+            if (shieldRank >= 0 && shieldRank <= 7) {
+              let shield = 0;
+              for (let df = -1; df <= 1; df++) {
+                const sf = kf + df;
+                if (sf < 0 || sf > 7)
+                  continue;
+                if (bd[shieldRank * 16 + sf] === side)
+                  shield++;
+              }
+              mgScore += shield * 15 * side;
+            }
+          }
+          if (wKingAttackers >= 1) {
+            const bonus = wKingAttackWeight * wKingAttackers / 2.5;
+            mgScore += bonus > 500 ? 500 : bonus;
+          }
+          if (bKingAttackers >= 1) {
+            const bonus = bKingAttackWeight * bKingAttackers / 2.5;
+            mgScore -= bonus > 500 ? 500 : bonus;
+          }
+          if (bKingSq >= 0) {
+            const kf = bKingSq & 7;
+            const fMin = kf > 0 ? kf - 1 : 0;
+            const fMax = kf < 7 ? kf + 1 : 7;
+            for (let f = fMin; f <= fMax; f++) {
+              const rank = wPawnRanks[f];
+              if (rank >= 3 && rank <= 6) {
+                const bonus = (rank - 2) * 20;
+                mgScore += bonus;
+                egScore += bonus / 2;
+              }
+            }
+          }
+          if (wKingSq >= 0) {
+            const kf = wKingSq & 7;
+            const fMin = kf > 0 ? kf - 1 : 0;
+            const fMax = kf < 7 ? kf + 1 : 7;
+            for (let f = fMin; f <= fMax; f++) {
+              const rank = bPawnRanks[f];
+              if (rank <= 4 && rank >= 1) {
+                const bonus = (5 - rank) * 15;
+                mgScore -= bonus;
+                egScore -= bonus / 2;
+              }
+            }
+          }
+          if (this.wQueens > 0 && this.bQueens > 0) {
+            const tradeAvoidanceBonus = 50;
+            const rootSide = this.rootSide ?? this.side;
+            if (rootSide === 1) {
+              mgScore += tradeAvoidanceBonus;
+              egScore += tradeAvoidanceBonus;
+            } else {
+              mgScore -= tradeAvoidanceBonus;
+              egScore -= tradeAvoidanceBonus;
+            }
+          }
+          const maxPhase = 24;
+          const ph = this.phase < maxPhase ? this.phase : maxPhase;
+          const score = (mgScore * ph + egScore * (maxPhase - ph)) / maxPhase + 0.5 | 0;
+          return score * this.side;
+        },
+        see(move) {
+          const from = move.from;
+          const to = move.to;
+          let victim = move.captured ? Math.abs(move.captured) : 0;
+          let attacker = move.promo ? Math.abs(move.promo) : Math.abs(move.piece);
+          let score = 0;
+          if (victim)
+            score += PIECE_VAL[victim];
+          if (move.promo)
+            score += PIECE_VAL[attacker] - PIECE_VAL[1];
+          const captures = [score];
+          const removed = [];
+          const originalFromPiece = this.board[from];
+          const originalToPiece = this.board[to];
+          this.board[from] = EMPTY;
+          this.board[to] = this.side * (move.promo ? move.promo : move.piece);
+          let currentSide = -this.side;
+          let currentVictimVal = PIECE_VAL[attacker];
+          try {
+            let d = 0;
+            while (d < 30) {
+              const att = this.getSmallestAttacker(to, currentSide);
+              if (!att)
+                break;
+              d++;
+              captures.push(currentVictimVal);
+              currentVictimVal = att.value;
+              removed.push({ sq: att.sq, p: this.board[att.sq] });
+              this.board[att.sq] = EMPTY;
+              currentSide = -currentSide;
+            }
+          } finally {
+            this.board[from] = originalFromPiece;
+            this.board[to] = originalToPiece;
+            for (let i = removed.length - 1; i >= 0; i--) {
+              this.board[removed[i].sq] = removed[i].p;
+            }
+          }
+          let val = 0;
+          for (let i = captures.length - 1; i >= 1; i--) {
+            val = Math.max(0, captures[i] - val);
+          }
+          return captures[0] - val;
+        },
+        // ---- Search ----
+        scoreMoves(moves, ply, ttMove) {
+          const scores = new Int32Array(moves.length);
+          for (let i = 0; i < moves.length; i++) {
+            const mv = moves[i];
+            let s = 0;
+            if (ttMove && mv.from === ttMove.from && mv.to === ttMove.to) {
+              s = 1e5;
+            } else if (mv.captured !== EMPTY) {
+              s = 1e4 + PIECE_VAL[Math.abs(mv.captured)] * 10 - PIECE_VAL[Math.abs(mv.piece)];
+            }
+            if (mv.flags & FLAG_PROMO)
+              s += 8e3 + PIECE_VAL[Math.abs(mv.promo)];
+            if (this.killers[ply] && this.killers[ply].includes(mv.from * 128 + mv.to))
+              s += 5e3;
+            s += this.history[mv.from * 128 + mv.to];
+            scores[i] = s;
+          }
+          return scores;
+        },
+        // Lazy selection sort: pick best move for position i, swap it in place
+        pickMove(moves, scores, startIdx) {
+          let bestIdx = startIdx;
+          let bestScore = scores[startIdx];
+          for (let j = startIdx + 1; j < moves.length; j++) {
+            if (scores[j] > bestScore) {
+              bestScore = scores[j];
+              bestIdx = j;
+            }
+          }
+          if (bestIdx !== startIdx) {
+            const tmpMv = moves[startIdx];
+            moves[startIdx] = moves[bestIdx];
+            moves[bestIdx] = tmpMv;
+            const tmpSc = scores[startIdx];
+            scores[startIdx] = scores[bestIdx];
+            scores[bestIdx] = tmpSc;
+          }
+        },
+        // --- Transposition Table (Zobrist-based) ---
+        ttKey() {
+          return this.hash[0] + "|" + this.hash[1];
+        },
+        ttIndex() {
+          return this.hash[1] & 65535;
+        },
+        ttProbe(depth, alpha, beta) {
+          const index = this.ttIndex();
+          const entry = this.tt[index];
+          if (!entry || entry.hashKey[0] !== this.hash[0] || entry.hashKey[1] !== this.hash[1])
+            return null;
+          if (entry.depth < depth)
+            return { score: null, move: entry.move };
+          if (entry.flag === TT_EXACT)
+            return { score: entry.score, move: entry.move };
+          if (entry.flag === TT_ALPHA && entry.score <= alpha)
+            return { score: alpha, move: entry.move };
+          if (entry.flag === TT_BETA && entry.score >= beta)
+            return { score: beta, move: entry.move };
+          return { score: null, move: entry.move };
+        },
+        ttStore(depth, score, flag, move) {
+          const index = this.ttIndex();
+          const existing = this.tt[index];
+          if (!existing || existing.depth <= depth) {
+            this.tt[index] = {
+              hashKey: [this.hash[0], this.hash[1]],
+              depth,
+              score,
+              flag,
+              move
+            };
+          }
+        },
+        quiesce(alpha, beta, ply, qply = 0) {
+          this.nodes++;
+          if (this.nodes % 4096 === 0 && this.searchCompletedDepth >= 3 && performance.now() - this.startTime > this.timeLimit) {
+            this.stopped = true;
+            return 0;
+          }
+          const inChk = this.inCheck(this.side);
+          let standPatVal = -MATE_SCORE;
+          if (!inChk) {
+            standPatVal = this.evaluate();
+            if (standPatVal >= beta)
+              return beta;
+            if (standPatVal > alpha)
+              alpha = standPatVal;
+          }
+          const searchChecks = !inChk && qply < 1;
+          const moves = this.generateMoves(inChk ? false : searchChecks ? false : true);
+          const scores = this.scoreMoves(moves, ply, null);
+          let legalMovesCount = 0;
+          for (let i = 0; i < moves.length; i++) {
+            this.pickMove(moves, scores, i);
+            const mv = moves[i];
+            const isCapture = mv.captured !== EMPTY;
+            const isPromo = mv.flags & FLAG_PROMO;
+            const toRank = mv.to >> 4;
+            const isPawnAdvanceTo7th = Math.abs(mv.piece) === 1 && (mv.piece > 0 && toRank === 6 || mv.piece < 0 && toRank === 1);
+            const isQuiet = !isCapture && !isPromo && !isPawnAdvanceTo7th;
+            if (!inChk) {
+              if (isQuiet && !searchChecks)
+                continue;
+              if (isCapture && !isPromo) {
+                if (standPatVal + PIECE_VAL[Math.abs(mv.captured)] + 300 < alpha)
+                  continue;
+              }
+            }
+            this.makeMove(mv);
+            if (this.inCheck(-this.side)) {
+              this.unmakeMove(mv);
+              continue;
+            }
+            if (!inChk && isQuiet && searchChecks) {
+              if (!this.inCheck(this.side)) {
+                this.unmakeMove(mv);
+                continue;
+              }
+            }
+            legalMovesCount++;
+            const score = -this.quiesce(-beta, -alpha, ply + 1, qply + 1);
+            this.unmakeMove(mv);
+            if (this.stopped)
+              return 0;
+            if (score >= beta)
+              return beta;
+            if (score > alpha)
+              alpha = score;
+          }
+          if (inChk && legalMovesCount === 0) {
+            return -(MATE_SCORE - ply);
+          }
+          return alpha;
+        },
+        negamax(depth, alpha, beta, ply, pvLine, ext) {
+          this.nodes++;
+          if (this.stopped)
+            return 0;
+          if (this.nodes % 4096 === 0 && this.searchCompletedDepth >= 3 && performance.now() - this.startTime > this.timeLimit) {
+            this.stopped = true;
+            return 0;
+          }
+          if (depth <= 0)
+            return this.quiesce(alpha, beta, ply, 0);
+          const inChk = this.inCheck(this.side);
+          if (inChk && ext < 16) {
+            depth++;
+            ext++;
+          }
+          const rootSide = this.rootSide ?? this.side;
+          const drawContempt = this.side === rootSide ? -this.contempt : this.contempt;
+          if (this.halfmove >= 100)
+            return drawContempt;
+          const posKey = this.ttKey();
+          let reps = 0;
+          for (let i = this.positionHistory.length - 1; i >= 0; i--) {
+            if (this.positionHistory[i] === posKey) {
+              reps++;
+              if (reps >= 2)
+                return drawContempt;
+              if (reps === 1 && this.contempt > 0) {
+              }
+            }
+          }
+          let ttMove = null;
+          const ttEntry = this.ttProbe(depth, alpha, beta);
+          if (ttEntry) {
+            ttMove = ttEntry.move;
+            if (ttEntry.score !== null && ply > 0)
+              return ttEntry.score;
+          }
+          if (depth <= 3 && !inChk && ply > 0 && Math.abs(beta - alpha) <= 1) {
+            const staticEval = this.evaluate();
+            const evalMargin = depth * 120;
+            if (staticEval - evalMargin >= beta) {
+              return beta;
+            }
+            const razorMargin = depth * 350;
+            if (staticEval + razorMargin < alpha) {
+              const qScore = this.quiesce(alpha, beta, ply + 1, 0);
+              if (qScore < alpha)
+                return alpha;
+            }
+          }
+          const moves = this.generateMoves(false);
+          if (!inChk && depth >= 2 && ply > 0 && Math.abs(beta - alpha) <= 1) {
+            const staticEval = this.evaluate();
+            if (staticEval >= beta) {
+              const sideMat = this.side === 1 ? this.wQueens * 900 + this.wRooks * 500 + this.wBishops * 330 + this.wKnights * 320 : this.bQueens * 900 + this.bRooks * 500 + this.bBishops * 330 + this.bKnights * 320;
+              if (sideMat > 0) {
+                this.makeNullMove();
+                const R = depth >= 6 ? 3 : 2;
+                const nullScore = -this.negamax(depth - 1 - R, -beta, -beta + 1, ply + 1, [], ext);
+                this.unmakeNullMove();
+                if (this.stopped)
+                  return 0;
+                if (nullScore >= beta)
+                  return beta;
+              }
+            }
+          }
+          const scores = this.scoreMoves(moves, ply, ttMove);
+          const childPv = [];
+          let bestMoveInNode = null;
+          let origAlpha = alpha;
+          let movesSearched = 0;
+          let legalMovesCount = 0;
+          for (let i = 0; i < moves.length; i++) {
+            this.pickMove(moves, scores, i);
+            const mv = moves[i];
+            this.makeMove(mv);
+            if (this.inCheck(-this.side)) {
+              this.unmakeMove(mv);
+              continue;
+            }
+            legalMovesCount++;
+            childPv.length = 0;
+            let score;
+            if (movesSearched === 0) {
+              score = -this.negamax(depth - 1, -beta, -alpha, ply + 1, childPv, ext);
+            } else {
+              score = -this.negamax(depth - 1, -alpha - 1, -alpha, ply + 1, childPv, ext);
+              if (score > alpha && score < beta) {
+                childPv.length = 0;
+                score = -this.negamax(depth - 1, -beta, -alpha, ply + 1, childPv, ext);
+              }
+            }
+            this.unmakeMove(mv);
+            movesSearched++;
+            if (this.stopped)
+              return 0;
+            if (score >= beta) {
+              if (mv.captured === EMPTY) {
+                if (!this.killers[ply])
+                  this.killers[ply] = [];
+                const key = mv.from * 128 + mv.to;
+                if (!this.killers[ply].includes(key)) {
+                  this.killers[ply].unshift(key);
+                  if (this.killers[ply].length > 2)
+                    this.killers[ply].pop();
+                }
+                this.history[mv.from * 128 + mv.to] += depth * depth;
+              }
+              this.ttStore(depth, beta, TT_BETA, mv);
+              return beta;
+            }
+            if (score <= origAlpha) {
+              if (mv.captured === EMPTY && !(mv.flags & FLAG_PROMO)) {
+                this.history[mv.from * 128 + mv.to] -= depth * depth;
+              }
+            }
+            if (score > alpha) {
+              alpha = score;
+              bestMoveInNode = mv;
+              pvLine.length = 0;
+              pvLine.push(mv);
+              pvLine.push(...childPv);
+            }
+          }
+          if (legalMovesCount === 0) {
+            return inChk ? -(MATE_SCORE - ply) : 0;
+          }
+          const flag = alpha > origAlpha ? TT_EXACT : TT_ALPHA;
+          this.ttStore(depth, alpha, flag, bestMoveInNode || moves[0]);
+          return alpha;
+        },
+        searchRoot(maxDepth, timeLimitMs) {
+          this.nodes = 0;
+          this.startTime = performance.now();
+          this.timeLimit = timeLimitMs;
+          this.stopped = false;
+          this.killers = [];
+          this.history.fill(0);
+          this.rootSide = this.side;
+          this.searchCompletedDepth = 0;
+          const legalMoves = this.generateLegalMoves();
+          if (legalMoves.length === 0) {
+            return { move: null, score: 0, pv: [], depth: 0, nodes: 0 };
+          }
+          let bestMove = legalMoves[0];
+          let bestScore = -MATE_SCORE;
+          let bestPv = [legalMoves[0]];
+          let completedDepth = 0;
+          for (let d = 1; d <= maxDepth; d++) {
+            if (d > 1) {
+              for (let i = 0; i < this.history.length; i++) {
+                this.history[i] >>= 1;
+              }
+            }
+            if (d > 1 && completedDepth > 0) {
+              if (bestScore > 200)
+                this.contempt = 60;
+              else if (bestScore > 100)
+                this.contempt = 45;
+              else if (bestScore > 50)
+                this.contempt = 35;
+              else if (bestScore > -100)
+                this.contempt = 25;
+              else if (bestScore > -250)
+                this.contempt = 10;
+              else
+                this.contempt = -15;
+            } else {
+              this.contempt = 25;
+            }
+            const pvLine = [];
+            const score = this.negamax(d, -MATE_SCORE - 1, MATE_SCORE + 1, 0, pvLine, 0);
+            if (this.stopped && d > 1)
+              break;
+            if (pvLine.length > 0) {
+              bestMove = pvLine[0];
+              bestScore = score;
+              bestPv = pvLine.slice();
+              completedDepth = d;
+              this.searchCompletedDepth = d;
+            }
+            const absScore = bestScore > 0 ? bestScore : -bestScore;
+            if (absScore > MATE_SCORE - 100)
+              break;
+          }
+          const whiteScore = bestScore * this.side;
+          return { move: bestMove, score: whiteScore, pv: bestPv, depth: completedDepth, nodes: this.nodes };
+        },
+        analyze(fen, depth, timeLimit) {
+          this.loadFen(fen);
+          this.clearTT();
+          const timeMs = timeLimit || 1e3;
+          const searchDepth = depth || 12;
+          this.contempt = 25;
+          const result = this.searchRoot(searchDepth, timeMs);
+          let dirtyPlayTimeScale = 1;
+          if (result.score < -500)
+            dirtyPlayTimeScale = 0.4;
+          else if (result.score < -200)
+            dirtyPlayTimeScale = 0.6;
+          else if (result.score < -100)
+            dirtyPlayTimeScale = 0.8;
+          if (!result.move) {
+            return { success: false, bestmove: "(none)", evaluation: 0, depth: result.depth || 0 };
+          }
+          const uci = this.moveToUci(result.move);
+          const pvStr = result.pv.map((m) => this.moveToUci(m)).join(" ");
+          let scoreObj;
+          const absScore = result.score > 0 ? result.score : -result.score;
+          if (absScore > MATE_SCORE - 200) {
+            const mateIn = (MATE_SCORE - absScore + 1) / 2 | 0;
+            scoreObj = { mate: result.score > 0 ? mateIn : -mateIn };
+          } else {
+            scoreObj = { cp: result.score };
+          }
+          return {
+            success: true,
+            bestmove: uci,
+            evaluation: result.score / 100,
+            analysis: [{ uci, pv: pvStr, score: scoreObj }],
+            depth: result.depth,
+            nodes: result.nodes,
+            source: "local",
+            dirtyPlayTimeScale
+          };
+        }
+      };
+    }
+  });
+
+  // src/engine/local-engine.js
+  var LocalEngine;
+  var init_local_engine = __esm({
+    "src/engine/local-engine.js"() {
+      init_constants();
+      init_pst();
+      init_zobrist();
+      init_utils2();
+      init_search();
+      LocalEngine = class {
+        constructor() {
+          this.board = new Int8Array(128).fill(EMPTY);
+          this.side = 1;
+          this.castling = 0;
+          this.epSquare = -1;
+          this.halfmove = 0;
+          this.fullmove = 1;
+          this.wKingSq = 4;
+          this.bKingSq = 116;
+          this.stateStack = [];
+          this.nodes = 0;
+          this.timeLimit = 0;
+          this.startTime = 0;
+          this.stopped = false;
+          this.pvTable = [];
+          this.killers = [];
+          this.history = new Int32Array(16384);
+          this.tt = new Array(TT_SIZE);
+          this.evalBufs = {
+            wPawnFiles: new Uint8Array(8),
+            bPawnFiles: new Uint8Array(8),
+            wPawnRanks: new Int8Array(8),
+            bPawnRanks: new Int8Array(8),
+            bPawnMaxRanks: new Int8Array(8),
+            wPawnMinRanks: new Int8Array(8),
+            rookSquares: new Int8Array(4),
+            rookSides: new Int8Array(4)
+          };
+          this.hash = [0, 0];
+          this.phase = 0;
+          this.positionHistory = [];
+          this.contempt = 0;
+          this.rootSide = 1;
+          this.mgPstMat = 0;
+          this.egPstMat = 0;
+          this.wBishops = 0;
+          this.bBishops = 0;
+          this.wKnights = 0;
+          this.bKnights = 0;
+          this.wRooks = 0;
+          this.bRooks = 0;
+          this.wQueens = 0;
+          this.bQueens = 0;
+        }
+        _packPieceCounts() {
+          return this.wQueens | this.bQueens << 4 | this.wRooks << 8 | this.bRooks << 12 | this.wBishops << 16 | this.bBishops << 20 | this.wKnights << 24 | this.bKnights << 28;
+        }
+        _unpackPieceCounts(packed) {
+          this.wQueens = packed & 15;
+          this.bQueens = packed >> 4 & 15;
+          this.wRooks = packed >> 8 & 15;
+          this.bRooks = packed >> 12 & 15;
+          this.wBishops = packed >> 16 & 15;
+          this.bBishops = packed >> 20 & 15;
+          this.wKnights = packed >> 24 & 15;
+          this.bKnights = packed >> 28 & 15;
+        }
+        makeNullMove() {
+          this.stateStack.push({
+            castling: this.castling,
+            epSquare: this.epSquare,
+            halfmove: this.halfmove,
+            fullmove: this.fullmove,
+            wKingSq: this.wKingSq,
+            bKingSq: this.bKingSq,
+            hash: [this.hash[0], this.hash[1]],
+            mgPstMat: this.mgPstMat,
+            egPstMat: this.egPstMat,
+            phase: this.phase,
+            pieceCounts: this._packPieceCounts()
+          });
+          if (this.epSquare >= 0) {
+            const ef = sqFile(this.epSquare) * 2;
+            zobXor(this.hash, [ZOBRIST.epKeys[ef], ZOBRIST.epKeys[ef + 1]]);
+          }
+          this.epSquare = -1;
+          this.side = -this.side;
+          zobXor(this.hash, ZOBRIST.sideKey);
+          this.halfmove++;
+          if (this.side === -1)
+            this.fullmove++;
+        }
+        unmakeNullMove() {
+          this.side = -this.side;
+          const st = this.stateStack.pop();
+          this.castling = st.castling;
+          this.epSquare = st.epSquare;
+          this.halfmove = st.halfmove;
+          this.fullmove = st.fullmove;
+          this.wKingSq = st.wKingSq;
+          this.bKingSq = st.bKingSq;
+          this.hash = st.hash;
+          this.mgPstMat = st.mgPstMat;
+          this.egPstMat = st.egPstMat;
+          this.phase = st.phase;
+          this._unpackPieceCounts(st.pieceCounts);
+        }
+        reset() {
+          this.history.fill(0);
+          this.killers = [];
+          this.tt = new Array(TT_SIZE);
+          this.positionHistory = [];
+        }
+        loadFen(fen) {
+          this.board.fill(EMPTY);
+          const parts = fen.split(" ");
+          const rows = parts[0].split("/");
+          const pieceMap = { p: BP, n: BN, b: BB, r: BR, q: BQ, k: BK, P: WP, N: WN, B: WB, R: WR, Q: WQ, K: WK };
+          for (let r = 0; r < 8; r++) {
+            let f = 0;
+            for (const ch of rows[7 - r]) {
+              if (ch >= "1" && ch <= "8") {
+                f += parseInt(ch);
+              } else {
+                const piece = pieceMap[ch] || EMPTY;
+                const sq = r * 16 + f;
+                this.board[sq] = piece;
+                if (piece === WK)
+                  this.wKingSq = sq;
+                else if (piece === BK)
+                  this.bKingSq = sq;
+                f++;
+              }
+            }
+          }
+          this.side = (parts[1] || "w") === "w" ? 1 : -1;
+          const c = parts[2] || "-";
+          this.castling = (c.includes("K") ? 1 : 0) | (c.includes("Q") ? 2 : 0) | (c.includes("k") ? 4 : 0) | (c.includes("q") ? 8 : 0);
+          this.epSquare = parts[3] && parts[3] !== "-" ? nameToSq(parts[3]) : -1;
+          this.halfmove = parseInt(parts[4]) || 0;
+          this.fullmove = parseInt(parts[5]) || 1;
+          this.stateStack = [];
+          this.positionHistory = [];
+          this._initIncrementalScores();
+          this._computeHash();
+        }
+        _initIncrementalScores() {
+          this.mgPstMat = 0;
+          this.egPstMat = 0;
+          this.phase = 0;
+          this.wBishops = 0;
+          this.bBishops = 0;
+          this.wKnights = 0;
+          this.bKnights = 0;
+          this.wRooks = 0;
+          this.bRooks = 0;
+          this.wQueens = 0;
+          this.bQueens = 0;
+          for (let sq = 0; sq < 128; sq++) {
+            if (sq & 136) {
+              sq += 7;
+              continue;
+            }
+            const p = this.board[sq];
+            if (p === EMPTY)
+              continue;
+            this._addPieceScore(p, sq);
+          }
+        }
+        _addPieceScore(p, sq) {
+          const side = p > 0 ? 1 : -1;
+          const abs = p > 0 ? p : -p;
+          const pstSq = side === 1 ? sq : sq ^ 112;
+          this.mgPstMat += (MAT_MG[abs] + PST_MG[abs][pstSq]) * side;
+          this.egPstMat += (MAT_EG[abs] + PST_EG[abs][pstSq]) * side;
+          if (abs >= 2 && abs <= 5)
+            this.phase += PHASE_VAL[abs];
+          if (abs === 2) {
+            if (side === 1)
+              this.wKnights++;
+            else
+              this.bKnights++;
+          }
+          if (abs === 3) {
+            if (side === 1)
+              this.wBishops++;
+            else
+              this.bBishops++;
+          }
+          if (abs === 4) {
+            if (side === 1)
+              this.wRooks++;
+            else
+              this.bRooks++;
+          }
+          if (abs === 5) {
+            if (side === 1)
+              this.wQueens++;
+            else
+              this.bQueens++;
+          }
+        }
+        _removePieceScore(p, sq) {
+          const side = p > 0 ? 1 : -1;
+          const abs = p > 0 ? p : -p;
+          const pstSq = side === 1 ? sq : sq ^ 112;
+          this.mgPstMat -= (MAT_MG[abs] + PST_MG[abs][pstSq]) * side;
+          this.egPstMat -= (MAT_EG[abs] + PST_EG[abs][pstSq]) * side;
+          if (abs >= 2 && abs <= 5)
+            this.phase -= PHASE_VAL[abs];
+          if (abs === 2) {
+            if (side === 1)
+              this.wKnights--;
+            else
+              this.bKnights--;
+          }
+          if (abs === 3) {
+            if (side === 1)
+              this.wBishops--;
+            else
+              this.bBishops--;
+          }
+          if (abs === 4) {
+            if (side === 1)
+              this.wRooks--;
+            else
+              this.bRooks--;
+          }
+          if (abs === 5) {
+            if (side === 1)
+              this.wQueens--;
+            else
+              this.bQueens--;
+          }
+        }
+        _computeHash() {
+          this.hash = [0, 0];
+          for (let sq = 0; sq < 128; sq++) {
+            if (sq & 136) {
+              sq += 7;
+              continue;
+            }
+            const p = this.board[sq];
+            if (p !== EMPTY)
+              zobXor(this.hash, zobPieceKey(p, sq));
+          }
+          if (this.side === -1)
+            zobXor(this.hash, ZOBRIST.sideKey);
+          const ck = this.castling * 2;
+          zobXor(this.hash, [ZOBRIST.castlingKeys[ck], ZOBRIST.castlingKeys[ck + 1]]);
+          if (this.epSquare >= 0) {
+            const ef = sqFile(this.epSquare) * 2;
+            zobXor(this.hash, [ZOBRIST.epKeys[ef], ZOBRIST.epKeys[ef + 1]]);
+          }
+        }
+        toFen() {
+          let fen = "";
+          for (let r = 7; r >= 0; r--) {
+            let empty = 0;
+            for (let f = 0; f < 8; f++) {
+              const p = this.board[r * 16 + f];
+              if (p === EMPTY) {
+                empty++;
+              } else {
+                if (empty) {
+                  fen += empty;
+                  empty = 0;
+                }
+                const abs = Math.abs(p);
+                const ch = "xpnbrqk"[abs];
+                fen += p > 0 ? ch.toUpperCase() : ch;
+              }
+            }
+            if (empty)
+              fen += empty;
+            if (r > 0)
+              fen += "/";
+          }
+          let c = "";
+          if (this.castling & 1)
+            c += "K";
+          if (this.castling & 2)
+            c += "Q";
+          if (this.castling & 4)
+            c += "k";
+          if (this.castling & 8)
+            c += "q";
+          if (!c)
+            c = "-";
+          const ep = this.epSquare >= 0 ? sqName(this.epSquare) : "-";
+          return `${fen} ${this.side === 1 ? "w" : "b"} ${c} ${ep} ${this.halfmove} ${this.fullmove}`;
+        }
+        createMove(from, to, flags = FLAG_NONE, promo = EMPTY) {
+          return {
+            from,
+            to,
+            flags,
+            piece: this.board[from],
+            captured: flags & FLAG_EP ? -this.side : this.board[to],
+            promo
+          };
+        }
+        makeMove(mv) {
+          this.positionHistory.push(this.hash[0] + "|" + this.hash[1]);
+          this.stateStack.push({
+            castling: this.castling,
+            epSquare: this.epSquare,
+            halfmove: this.halfmove,
+            fullmove: this.fullmove,
+            wKingSq: this.wKingSq,
+            bKingSq: this.bKingSq,
+            hash: [this.hash[0], this.hash[1]],
+            mgPstMat: this.mgPstMat,
+            egPstMat: this.egPstMat,
+            phase: this.phase,
+            pieceCounts: this._packPieceCounts()
+          });
+          const { from, to, flags, piece, promo } = mv;
+          const abs = Math.abs(piece);
+          zobXor(this.hash, zobPieceKey(piece, from));
+          if (mv.captured !== EMPTY && !(flags & FLAG_EP)) {
+            zobXor(this.hash, zobPieceKey(mv.captured, to));
+            this._removePieceScore(mv.captured, to);
+          }
+          this.board[from] = EMPTY;
+          this._removePieceScore(piece, from);
+          const landed = flags & FLAG_PROMO ? promo : piece;
+          this.board[to] = landed;
+          this._addPieceScore(landed, to);
+          zobXor(this.hash, zobPieceKey(landed, to));
+          if (abs === 6) {
+            if (this.side === 1)
+              this.wKingSq = to;
+            else
+              this.bKingSq = to;
+          }
+          if (flags & FLAG_EP) {
+            const epCapSq = to - this.side * 16;
+            const capPawn = this.board[epCapSq] || -this.side;
+            zobXor(this.hash, zobPieceKey(capPawn, epCapSq));
+            this._removePieceScore(capPawn, epCapSq);
+            this.board[epCapSq] = EMPTY;
+          }
+          if (flags & FLAG_CASTLE) {
+            if (to > from) {
+              const rook = this.side * WR;
+              zobXor(this.hash, zobPieceKey(rook, from + 3));
+              this._removePieceScore(rook, from + 3);
+              this.board[from + 3] = EMPTY;
+              this.board[from + 1] = rook;
+              zobXor(this.hash, zobPieceKey(rook, from + 1));
+              this._addPieceScore(rook, from + 1);
+            } else {
+              const rook = this.side * WR;
+              zobXor(this.hash, zobPieceKey(rook, from - 4));
+              this._removePieceScore(rook, from - 4);
+              this.board[from - 4] = EMPTY;
+              this.board[from - 1] = rook;
+              zobXor(this.hash, zobPieceKey(rook, from - 1));
+              this._addPieceScore(rook, from - 1);
+            }
+          }
+          const oldCastling = this.castling;
+          if (this.epSquare >= 0) {
+            const ef = sqFile(this.epSquare) * 2;
+            zobXor(this.hash, [ZOBRIST.epKeys[ef], ZOBRIST.epKeys[ef + 1]]);
+          }
+          if (abs === 1 && Math.abs(to - from) === 32) {
+            this.epSquare = from + to >> 1;
+          } else {
+            this.epSquare = -1;
+          }
+          if (this.epSquare >= 0) {
+            const ef = sqFile(this.epSquare) * 2;
+            zobXor(this.hash, [ZOBRIST.epKeys[ef], ZOBRIST.epKeys[ef + 1]]);
+          }
+          if (abs === 6) {
+            if (this.side === 1)
+              this.castling &= ~3;
+            else
+              this.castling &= ~12;
+          }
+          if (from === 0 || to === 0)
+            this.castling &= ~2;
+          if (from === 7 || to === 7)
+            this.castling &= ~1;
+          if (from === 112 || to === 112)
+            this.castling &= ~8;
+          if (from === 119 || to === 119)
+            this.castling &= ~4;
+          if (oldCastling !== this.castling) {
+            const oc = oldCastling * 2, nc = this.castling * 2;
+            zobXor(this.hash, [ZOBRIST.castlingKeys[oc], ZOBRIST.castlingKeys[oc + 1]]);
+            zobXor(this.hash, [ZOBRIST.castlingKeys[nc], ZOBRIST.castlingKeys[nc + 1]]);
+          }
+          this.halfmove = abs === 1 || mv.captured !== EMPTY ? 0 : this.halfmove + 1;
+          if (this.side === -1)
+            this.fullmove++;
+          this.side = -this.side;
+          zobXor(this.hash, ZOBRIST.sideKey);
+        }
+        unmakeMove(mv) {
+          this.side = -this.side;
+          this.positionHistory.pop();
+          const st = this.stateStack.pop();
+          this.castling = st.castling;
+          this.epSquare = st.epSquare;
+          this.halfmove = st.halfmove;
+          this.fullmove = st.fullmove;
+          this.wKingSq = st.wKingSq;
+          this.bKingSq = st.bKingSq;
+          this.hash = st.hash;
+          this.mgPstMat = st.mgPstMat;
+          this.egPstMat = st.egPstMat;
+          this.phase = st.phase;
+          this._unpackPieceCounts(st.pieceCounts);
+          const { from, to, flags, piece, captured, promo } = mv;
+          this.board[from] = piece;
+          this.board[to] = flags & FLAG_EP ? EMPTY : captured;
+          if (flags & FLAG_EP) {
+            this.board[to - this.side * 16] = -this.side;
+          }
+          if (flags & FLAG_CASTLE) {
+            if (to > from) {
+              this.board[from + 1] = EMPTY;
+              this.board[from + 3] = this.side * WR;
+            } else {
+              this.board[from - 1] = EMPTY;
+              this.board[from - 4] = this.side * WR;
+            }
+          }
+        }
+        findKingSq(side) {
+          return side === 1 ? this.wKingSq : this.bKingSq;
+        }
+        isAttacked(sq, bySide) {
+          const pawnDir = bySide === 1 ? 1 : -1;
+          const attackSourceRank = (sq >> 4) - pawnDir;
+          if (attackSourceRank >= 0 && attackSourceRank <= 7) {
+            const sourceSqBase = sq - pawnDir * 16;
+            const s1 = sourceSqBase - 1;
+            if (!(s1 & 136) && this.board[s1] === bySide)
+              return true;
+            const s2 = sourceSqBase + 1;
+            if (!(s2 & 136) && this.board[s2] === bySide)
+              return true;
+          }
+          const kn = bySide * WN;
+          for (let i = 0; i < 8; i++) {
+            const t = sq - KNIGHT_OFFSETS[i];
+            if (t & 136)
+              continue;
+            if (this.board[t] === kn)
+              return true;
+          }
+          const kg = bySide * WK;
+          for (let i = 0; i < 8; i++) {
+            const t = sq + ALL_DIRS[i];
+            if (t & 136)
+              continue;
+            if (this.board[t] === kg)
+              return true;
+          }
+          const sideR = bySide * WR, sideQ = bySide * WQ, sideB = bySide * WB;
+          for (let i = 0; i < 4; i++) {
+            const dir = STRAIGHT_DIRS[i];
+            let t = sq + dir;
+            while (!(t & 136)) {
+              const p = this.board[t];
+              if (p !== EMPTY) {
+                if (p === sideR || p === sideQ)
+                  return true;
+                break;
+              }
+              t += dir;
+            }
+          }
+          for (let i = 0; i < 4; i++) {
+            const dir = DIAG_DIRS[i];
+            let t = sq + dir;
+            while (!(t & 136)) {
+              const p = this.board[t];
+              if (p !== EMPTY) {
+                if (p === sideB || p === sideQ)
+                  return true;
+                break;
+              }
+              t += dir;
+            }
+          }
+          return false;
+        }
+        inCheck(side) {
+          const ksq = this.findKingSq(side);
+          return ksq >= 0 && this.isAttacked(ksq, -side);
+        }
+        generateMoves(capturesOnly = false) {
+          const moves = [];
+          const s = this.side;
+          const opp = -s;
+          const bd = this.board;
+          for (let sq = 0; sq < 128; sq++) {
+            if (sq & 136) {
+              sq += 7;
+              continue;
+            }
+            const p = bd[sq];
+            if (p === EMPTY || (p > 0 ? 1 : -1) !== s)
+              continue;
+            const abs = p > 0 ? p : -p;
+            if (abs === 1) {
+              const dir = s;
+              const promoRank = s === 1 ? 7 : 0;
+              const startRank = s === 1 ? 1 : 6;
+              const fwd = sq + dir * 16;
+              if (!(fwd & 136) && bd[fwd] === EMPTY) {
+                if (fwd >> 4 === promoRank) {
+                  for (const pr of [WQ, WR, WB, WN])
+                    moves.push(this.createMove(sq, fwd, FLAG_PROMO, s * pr));
+                } else if (!capturesOnly) {
+                  moves.push(this.createMove(sq, fwd));
+                  const fwd2 = fwd + dir * 16;
+                  if (sq >> 4 === startRank && !(fwd2 & 136) && bd[fwd2] === EMPTY) {
+                    moves.push(this.createMove(sq, fwd2));
+                  }
+                }
+              }
+              const captureOffsets = [dir * 16 - 1, dir * 16 + 1];
+              for (const offset of captureOffsets) {
+                const csq = sq + offset;
+                if (csq & 136)
+                  continue;
+                const cp = bd[csq];
+                if (cp !== EMPTY && (cp > 0 ? 1 : -1) === opp) {
+                  if (csq >> 4 === promoRank) {
+                    for (const pr of [WQ, WR, WB, WN])
+                      moves.push(this.createMove(sq, csq, FLAG_PROMO, s * pr));
+                  } else {
+                    moves.push(this.createMove(sq, csq));
+                  }
+                } else if (csq === this.epSquare) {
+                  moves.push(this.createMove(sq, csq, FLAG_EP));
+                }
+              }
+            } else if (abs === 2) {
+              for (let i = 0; i < 8; i++) {
+                const t = sq + KNIGHT_OFFSETS[i];
+                if (t & 136)
+                  continue;
+                const tp = bd[t];
+                if (tp !== EMPTY && (tp > 0 ? 1 : -1) === s)
+                  continue;
+                if (capturesOnly && tp === EMPTY)
+                  continue;
+                moves.push(this.createMove(sq, t));
+              }
+            } else if (abs === 6) {
+              for (let i = 0; i < 8; i++) {
+                const t = sq + ALL_DIRS[i];
+                if (t & 136)
+                  continue;
+                const tp = bd[t];
+                if (tp !== EMPTY && (tp > 0 ? 1 : -1) === s)
+                  continue;
+                if (capturesOnly && tp === EMPTY)
+                  continue;
+                moves.push(this.createMove(sq, t));
+              }
+              if (!capturesOnly && !this.inCheck(s)) {
+                if (s === 1) {
+                  if (this.castling & 1 && sq === 4 && bd[5] === EMPTY && bd[6] === EMPTY && !this.isAttacked(5, -1) && !this.isAttacked(6, -1)) {
+                    moves.push(this.createMove(4, 6, FLAG_CASTLE));
+                  }
+                  if (this.castling & 2 && sq === 4 && bd[3] === EMPTY && bd[2] === EMPTY && bd[1] === EMPTY && !this.isAttacked(3, -1) && !this.isAttacked(2, -1)) {
+                    moves.push(this.createMove(4, 2, FLAG_CASTLE));
+                  }
+                } else {
+                  if (this.castling & 4 && sq === 116 && bd[117] === EMPTY && bd[118] === EMPTY && !this.isAttacked(117, 1) && !this.isAttacked(118, 1)) {
+                    moves.push(this.createMove(116, 118, FLAG_CASTLE));
+                  }
+                  if (this.castling & 8 && sq === 116 && bd[115] === EMPTY && bd[114] === EMPTY && bd[113] === EMPTY && !this.isAttacked(115, 1) && !this.isAttacked(114, 1)) {
+                    moves.push(this.createMove(116, 114, FLAG_CASTLE));
+                  }
+                }
+              }
+            } else {
+              const dirs = abs === 3 ? DIAG_DIRS : abs === 4 ? STRAIGHT_DIRS : ALL_DIRS;
+              for (let di = 0; di < dirs.length; di++) {
+                const dir = dirs[di];
+                let t = sq + dir;
+                while (!(t & 136)) {
+                  const tp = bd[t];
+                  if (tp !== EMPTY && (tp > 0 ? 1 : -1) === s)
+                    break;
+                  if (!capturesOnly || tp !== EMPTY)
+                    moves.push(this.createMove(sq, t));
+                  if (tp !== EMPTY)
+                    break;
+                  t += dir;
+                }
+              }
+            }
+          }
+          return moves;
+        }
+        generateLegalMoves(capturesOnly = false) {
+          const pseudo = this.generateMoves(capturesOnly);
+          const legal = [];
+          for (const mv of pseudo) {
+            this.makeMove(mv);
+            if (!this.inCheck(-this.side))
+              legal.push(mv);
+            this.unmakeMove(mv);
+          }
+          return legal;
+        }
+        moveToUci(mv) {
+          let s = sqName(mv.from) + sqName(mv.to);
+          if (mv.flags & FLAG_PROMO) {
+            s += "nbrq"[Math.abs(mv.promo) - 2];
+          }
+          return s;
+        }
+        getSmallestAttacker(sq, bySide) {
+          const pawnDir = bySide === 1 ? 1 : -1;
+          const attackSourceRank = (sq >> 4) - pawnDir;
+          if (attackSourceRank >= 0 && attackSourceRank <= 7) {
+            const sourceSqBase = sq - pawnDir * 16;
+            for (const offset of [-1, 1]) {
+              const s = sourceSqBase + offset;
+              if (!(s & 136) && this.board[s] === bySide) {
+                return { piece: bySide, sq: s, value: PIECE_VAL[1] };
+              }
+            }
+          }
+          const kn = bySide * WN;
+          for (let i = 0; i < 8; i++) {
+            const t = sq + KNIGHT_OFFSETS[i];
+            if (t & 136)
+              continue;
+            if (this.board[t] === kn)
+              return { piece: kn, sq: t, value: PIECE_VAL[2] };
+          }
+          const sideB = bySide * WB;
+          const sideQ = bySide * WQ;
+          for (let i = 0; i < 4; i++) {
+            const dir = DIAG_DIRS[i];
+            let t = sq + dir;
+            while (!(t & 136)) {
+              const p = this.board[t];
+              if (p !== EMPTY) {
+                if (p === sideB || p === sideQ) {
+                  return { piece: p, sq: t, value: PIECE_VAL[Math.abs(p)] };
+                }
+                break;
+              }
+              t += dir;
+            }
+          }
+          const sideR = bySide * WR;
+          for (let i = 0; i < 4; i++) {
+            const dir = STRAIGHT_DIRS[i];
+            let t = sq + dir;
+            while (!(t & 136)) {
+              const p = this.board[t];
+              if (p !== EMPTY) {
+                if (p === sideR || p === sideQ) {
+                  return { piece: p, sq: t, value: PIECE_VAL[Math.abs(p)] };
+                }
+                break;
+              }
+              t += dir;
+            }
+          }
+          const kg = bySide * WK;
+          for (let i = 0; i < 8; i++) {
+            const t = sq + ALL_DIRS[i];
+            if (t & 136)
+              continue;
+            if (this.board[t] === kg)
+              return { piece: kg, sq: t, value: PIECE_VAL[6] };
+          }
+          return null;
+        }
+      };
+      Object.assign(LocalEngine.prototype, SearchMethods);
+    }
+  });
+
+  // src/engine/analysis.js
+  function analyzeLocally(fen, depth, timeLimit) {
+    const start = performance.now();
+    const result = localEngine.analyze(fen, depth, timeLimit);
+    const elapsed = performance.now() - start;
+    return result;
+  }
+  function resetEngine() {
+    if (localEngine && typeof localEngine.reset === "function") {
+      localEngine.reset();
+    } else if (localEngine && typeof localEngine.clearTT === "function") {
+      localEngine.clearTT();
+    }
+  }
+  async function getAnalysis(fen, depth, timeLimit, signal) {
+    const cached = PositionCache.get(fen);
+    if (cached) {
+      return cached;
+    }
+    if (signal?.aborted)
+      throw new DOMException("Aborted", "AbortError");
+    const res = analyzeLocally(fen, depth, timeLimit);
+    await new Promise((r) => setTimeout(r, 0));
+    if (res.success && res.depth >= 1) {
+      PositionCache.set(fen, res);
+    }
+    return res;
+  }
+  function parseBestLine(data) {
+    const lines = [];
+    const pushLine = (uci, pv, score) => {
+      if (!uci || uci.length < 4 || uci === "(none)" || !/^[a-h]/.test(uci))
+        return;
+      lines.push({ uci: uci.trim(), pv: (pv || "").trim(), score: score || {} });
+    };
+    const addFromArray = (arr) => arr.forEach((item) => {
+      const pv = item.pv || item.line || item.moves || "";
+      const uci = item.uci || (pv ? pv.split(" ")[0] : "");
+      const score = scoreFrom(item.score || item.evaluation || item.eval);
+      pushLine(uci, pv, score);
+    });
+    if (Array.isArray(data.analysis))
+      addFromArray(data.analysis);
+    else if (Array.isArray(data.lines))
+      addFromArray(data.lines);
+    else if (Array.isArray(data.pvs))
+      addFromArray(data.pvs);
+    if (!lines.length && typeof data.bestmove === "string") {
+      const parts = data.bestmove.split(" ");
+      let uci = parts.length > 1 ? parts[1] : parts[0];
+      if (uci === "bestmove" && parts[1])
+        uci = parts[1];
+      const pv = data.pv || data.continuation || uci;
+      const score = scoreFrom(data.evaluation);
+      pushLine(uci, pv, score);
+    }
+    lines.sort((a, b) => scoreNumeric(b.score) - scoreNumeric(a.score));
+    return lines[0] || null;
+  }
+  var localEngine;
+  var init_analysis = __esm({
+    "src/engine/analysis.js"() {
+      init_state();
+      init_utils();
+      init_local_engine();
+      localEngine = new LocalEngine();
+    }
+  });
+
+  // src/engine/premove.js
+  function parsePromotion(uci) {
+    if (!uci || uci.length < 5)
+      return null;
+    const map = { q: 5, r: 4, b: 3, n: 2 };
+    return map[uci[4].toLowerCase()] || null;
+  }
+  function findMove(moves, from, to, promo) {
+    const candidates = moves.filter((m) => m.from === from && m.to === to);
+    if (candidates.length === 0)
+      return void 0;
+    if (!promo || candidates.length === 1)
+      return candidates[0];
+    const promoMatch = candidates.find((m) => {
+      const mp = m.promotedPiece ?? m.promoted ?? m.promo ?? 0;
+      return Math.abs(mp) === promo;
+    });
+    return promoMatch || candidates[0];
+  }
+  function resetTimer(engine, ms) {
+    engine.startTime = performance.now();
+    engine.timeLimit = ms;
+    engine.stopped = false;
+    engine.nodes = 0;
+  }
+  function checkHanging(engine, ourMove) {
+    const seeScore = engine.see(ourMove);
+    if (seeScore < 0) {
+      return { hanging: true, reason: `Unsafe trade (SEE ${seeScore})` };
+    }
+    return { hanging: false, reason: null };
+  }
+  function evaluatePremove(fen, opponentUci, ourUci, ourColor) {
+    if (!ourUci || ourUci.length < 4) {
+      return { execute: false, confidence: 0, reasons: [], blocked: "Invalid move" };
+    }
+    if (!opponentUci || opponentUci.length < 4) {
+      return { execute: false, confidence: 0, reasons: [], blocked: "No predicted opponent move" };
+    }
+    const oppSide = ourColor === "w" ? -1 : 1;
+    const ourSide = -oppSide;
+    const reasons = [];
+    let confidence = 0.7;
+    try {
+      premoveEngine.loadFen(fen);
+      resetTimer(premoveEngine, PREMOVE_CONFIG.quiesceMsScoring);
+      const oppFrom = nameToSq(opponentUci.substring(0, 2));
+      const oppTo = nameToSq(opponentUci.substring(2, 4));
+      const oppPromo = parsePromotion(opponentUci);
+      const oppMoves = premoveEngine.generateLegalMoves();
+      const oppMove = findMove(oppMoves, oppFrom, oppTo, oppPromo);
+      if (!oppMove) {
+        return { execute: false, confidence: 0, reasons: [], blocked: "Opponent move not legal" };
+      }
+      premoveEngine.makeMove(oppMove);
+      const ourLegalMoves = premoveEngine.generateLegalMoves();
+      const ourFrom = nameToSq(ourUci.substring(0, 2));
+      const ourTo = nameToSq(ourUci.substring(2, 4));
+      const ourPromo = parsePromotion(ourUci);
+      const ourMove = findMove(ourLegalMoves, ourFrom, ourTo, ourPromo);
+      if (!ourMove) {
+        premoveEngine.unmakeMove(oppMove);
+        return { execute: false, confidence: 0, reasons: [], blocked: "Our move illegal after opponent plays" };
+      }
+      const hangResult = checkHanging(premoveEngine, ourMove);
+      if (hangResult.hanging) {
+        premoveEngine.unmakeMove(oppMove);
+        return { execute: false, confidence: 0, reasons: [], blocked: hangResult.reason };
+      }
+      premoveEngine.makeMove(ourMove);
+      const ourKingSq = premoveEngine.findKingSq(ourSide);
+      if (ourKingSq >= 0) {
+        const kRank = sqRank(ourKingSq);
+        const isBackRank = ourSide === 1 && kRank === 0 || ourSide === -1 && kRank === 7;
+        if (isBackRank) {
+          const shieldRank = kRank + ourSide;
+          if (shieldRank >= 0 && shieldRank <= 7) {
+            const kFile = sqFile(ourKingSq);
+            let escapable = false;
+            for (let df = -1; df <= 1; df++) {
+              const sf = kFile + df;
+              if (sf < 0 || sf > 7)
+                continue;
+              const shieldSq = shieldRank * 16 + sf;
+              if (premoveEngine.board[shieldSq] === EMPTY && !premoveEngine.isAttacked(shieldSq, oppSide)) {
+                escapable = true;
+                break;
+              }
+            }
+            if (!escapable) {
+              if (premoveEngine.isAttacked(ourKingSq, oppSide)) {
+                premoveEngine.unmakeMove(ourMove);
+                premoveEngine.unmakeMove(oppMove);
+                return { execute: false, confidence: 0, reasons: [], blocked: "Back-rank mate threat" };
+              }
+              reasons.push("back-rank weak");
+              confidence -= 0.1;
+            }
+          }
+        }
+      }
+      if (premoveEngine.inCheck(oppSide)) {
+        reasons.push("check");
+        confidence += 0.1;
+      }
+      if (ourMove.flags & FLAG_PROMO) {
+        reasons.push("promotion");
+      }
+      if (ourMove.flags & FLAG_CASTLE) {
+        reasons.push("castling");
+        confidence += 0.05;
+      }
+      if (ourMove.flags & FLAG_EP) {
+        reasons.push("en passant");
+        confidence -= 0.05;
+      }
+      premoveEngine.unmakeMove(ourMove);
+      if (ourLegalMoves.length === 1) {
+        reasons.push("forced");
+        confidence += 0.2;
+      } else if (ourLegalMoves.length <= 3) {
+        reasons.push("few options");
+        confidence += 0.05;
+      }
+      if (ourTo === oppTo) {
+        reasons.push("recapture");
+        confidence += 0.1;
+      }
+      if (!premoveEngine.isAttacked(ourTo, oppSide)) {
+        reasons.push("safe sq");
+        confidence += 0.05;
+      }
+      const centerSquares = [nameToSq("d4"), nameToSq("d5"), nameToSq("e4"), nameToSq("e5")];
+      if (centerSquares.includes(ourTo)) {
+        reasons.push("center");
+      }
+      resetTimer(premoveEngine, PREMOVE_CONFIG.quiesceMsScoring);
+      premoveEngine.makeMove(ourMove);
+      const mainEval = -premoveEngine.quiesce(-MATE_SCORE, MATE_SCORE, 0);
+      premoveEngine.unmakeMove(ourMove);
+      let mainBestAlt = -Infinity;
+      for (const alt of ourLegalMoves) {
+        if (alt.from === ourFrom && alt.to === ourTo)
+          continue;
+        resetTimer(premoveEngine, PREMOVE_CONFIG.quiesceMsPerMove);
+        premoveEngine.makeMove(alt);
+        const altEval = -premoveEngine.quiesce(-MATE_SCORE, MATE_SCORE, 0);
+        premoveEngine.unmakeMove(alt);
+        if (altEval > mainBestAlt)
+          mainBestAlt = altEval;
+      }
+      const mainIsMate = mainEval > MATE_SCORE - 100;
+      if (!mainIsMate && mainBestAlt > -Infinity && mainBestAlt - mainEval > PREMOVE_CONFIG.stabilityThreshold) {
+        premoveEngine.unmakeMove(oppMove);
+        return {
+          execute: false,
+          confidence: 0,
+          reasons: ["suboptimal"],
+          blocked: "Move suboptimal against predicted opponent move"
+        };
+      }
+      premoveEngine.unmakeMove(oppMove);
+      const preSorted = oppMoves.filter((m) => !(m.from === oppFrom && m.to === oppTo)).map((m) => ({
+        move: m,
+        priority: m.captured !== EMPTY ? PIECE_VAL[Math.abs(m.captured)] || 0 : 0
+      })).sort((a, b) => b.priority - a.priority).slice(0, PREMOVE_CONFIG.altMovesToCheck + 4);
+      const scored = [];
+      for (const { move: oMove } of preSorted) {
+        resetTimer(premoveEngine, PREMOVE_CONFIG.quiesceMsPerMove);
+        premoveEngine.makeMove(oMove);
+        const score = -premoveEngine.quiesce(-MATE_SCORE, MATE_SCORE, 0);
+        premoveEngine.unmakeMove(oMove);
+        scored.push({ move: oMove, score });
+      }
+      scored.sort((a, b) => b.score - a.score);
+      const topAlts = scored.slice(0, PREMOVE_CONFIG.altMovesToCheck);
+      for (const { move: altOppMove } of topAlts) {
+        premoveEngine.makeMove(altOppMove);
+        const altLegal = premoveEngine.generateLegalMoves();
+        const altOurMove = findMove(altLegal, ourFrom, ourTo, ourPromo);
+        if (!altOurMove) {
+          premoveEngine.unmakeMove(altOppMove);
+          continue;
+        }
+        resetTimer(premoveEngine, PREMOVE_CONFIG.quiesceMsPerMove);
+        premoveEngine.makeMove(altOurMove);
+        const postScore = -premoveEngine.quiesce(-MATE_SCORE, MATE_SCORE, 0);
+        premoveEngine.unmakeMove(altOurMove);
+        let bestAlt = -Infinity;
+        for (const alt of altLegal) {
+          if (alt.from === ourFrom && alt.to === ourTo)
+            continue;
+          resetTimer(premoveEngine, PREMOVE_CONFIG.quiesceMsPerMove);
+          premoveEngine.makeMove(alt);
+          const altS = -premoveEngine.quiesce(-MATE_SCORE, MATE_SCORE, 0);
+          premoveEngine.unmakeMove(alt);
+          if (altS > bestAlt)
+            bestAlt = altS;
+        }
+        premoveEngine.unmakeMove(altOppMove);
+        const postIsMate = postScore > MATE_SCORE - 100;
+        if (!postIsMate && bestAlt > -Infinity && bestAlt - postScore > PREMOVE_CONFIG.stabilityThreshold) {
+          return {
+            execute: false,
+            confidence: 0,
+            reasons: ["unstable"],
+            blocked: "Move suboptimal in alternate opponent response"
+          };
+        }
+      }
+    } catch (e) {
+      console.warn("GabiBot: evaluatePremove error:", e);
+      return { execute: false, confidence: 0, reasons: [], blocked: "Evaluation error" };
+    }
+    confidence = Math.max(0, Math.min(1, confidence));
+    const execute = confidence >= PREMOVE_CONFIG.minConfidence;
+    return { execute, confidence, reasons, blocked: execute ? null : "Low confidence" };
+  }
+  function evaluatePremoveChain(fen, pv, ourColor, sideToMove) {
+    if (!pv)
+      return [];
+    const moves = pv.trim().split(/\s+/).filter(Boolean);
+    if (moves.length < 2)
+      return [];
+    if (sideToMove === ourColor)
+      return [];
+    const oppSide = ourColor === "w" ? -1 : 1;
+    const ourSide = -oppSide;
+    const pairs = [];
+    for (let i = 0; i + 1 < moves.length; i += 2) {
+      pairs.push({ oppUci: moves[i], ourUci: moves[i + 1] });
+    }
+    if (pairs.length === 0)
+      return [];
+    const first = evaluatePremove(fen, pairs[0].oppUci, pairs[0].ourUci, ourColor);
+    if (!first.execute)
+      return [];
+    const chain = [{
+      uci: pairs[0].ourUci,
+      oppUci: pairs[0].oppUci,
+      confidence: first.confidence,
+      reasons: first.reasons
+    }];
+    if (pairs.length < 2)
+      return chain;
+    try {
+      premoveEngine.loadFen(fen);
+      const m0OppFrom = nameToSq(pairs[0].oppUci.substring(0, 2));
+      const m0OppTo = nameToSq(pairs[0].oppUci.substring(2, 4));
+      const m0OppPromo = parsePromotion(pairs[0].oppUci);
+      let legalMoves = premoveEngine.generateLegalMoves();
+      const m0Opp = findMove(legalMoves, m0OppFrom, m0OppTo, m0OppPromo);
+      if (!m0Opp)
+        return chain;
+      premoveEngine.makeMove(m0Opp);
+      const m0OurFrom = nameToSq(pairs[0].ourUci.substring(0, 2));
+      const m0OurTo = nameToSq(pairs[0].ourUci.substring(2, 4));
+      const m0OurPromo = parsePromotion(pairs[0].ourUci);
+      legalMoves = premoveEngine.generateLegalMoves();
+      const m0Our = findMove(legalMoves, m0OurFrom, m0OurTo, m0OurPromo);
+      if (!m0Our) {
+        premoveEngine.unmakeMove(m0Opp);
+        return chain;
+      }
+      premoveEngine.makeMove(m0Our);
+      const appliedMoves = [m0Opp, m0Our];
+      for (let i = 1; i < pairs.length && chain.length < PREMOVE_CONFIG.maxChainDepth; i++) {
+        const { oppUci, ourUci } = pairs[i];
+        if (!oppUci || !ourUci || oppUci.length < 4 || ourUci.length < 4)
+          break;
+        const oFrom = nameToSq(oppUci.substring(0, 2));
+        const oTo = nameToSq(oppUci.substring(2, 4));
+        const oPromo = parsePromotion(oppUci);
+        legalMoves = premoveEngine.generateLegalMoves();
+        const oMove = findMove(legalMoves, oFrom, oTo, oPromo);
+        if (!oMove)
+          break;
+        premoveEngine.makeMove(oMove);
+        appliedMoves.push(oMove);
+        const uFrom = nameToSq(ourUci.substring(0, 2));
+        const uTo = nameToSq(ourUci.substring(2, 4));
+        const uPromo = parsePromotion(ourUci);
+        legalMoves = premoveEngine.generateLegalMoves();
+        const uMove = findMove(legalMoves, uFrom, uTo, uPromo);
+        if (!uMove) {
+          premoveEngine.unmakeMove(oMove);
+          appliedMoves.pop();
+          break;
+        }
+        const chainHang = checkHanging(premoveEngine, uMove);
+        if (chainHang.hanging) {
+          premoveEngine.unmakeMove(oMove);
+          appliedMoves.pop();
+          break;
+        }
+        resetTimer(premoveEngine, PREMOVE_CONFIG.quiesceMsPerMove);
+        premoveEngine.makeMove(uMove);
+        const chainOurEval = -premoveEngine.quiesce(-MATE_SCORE, MATE_SCORE, 0);
+        premoveEngine.unmakeMove(uMove);
+        let chainBestAlt = -Infinity;
+        for (const cAlt of legalMoves) {
+          if (cAlt.from === uFrom && cAlt.to === uTo)
+            continue;
+          resetTimer(premoveEngine, PREMOVE_CONFIG.quiesceMsPerMove);
+          premoveEngine.makeMove(cAlt);
+          const cAltEval = -premoveEngine.quiesce(-MATE_SCORE, MATE_SCORE, 0);
+          premoveEngine.unmakeMove(cAlt);
+          if (cAltEval > chainBestAlt)
+            chainBestAlt = cAltEval;
+        }
+        const chainIsMate = chainOurEval > MATE_SCORE - 100;
+        if (!chainIsMate && chainBestAlt > -Infinity && chainBestAlt - chainOurEval > PREMOVE_CONFIG.stabilityThreshold) {
+          premoveEngine.unmakeMove(oMove);
+          appliedMoves.pop();
+          break;
+        }
+        premoveEngine.makeMove(uMove);
+        appliedMoves.push(uMove);
+        const moveReasons = [];
+        if (premoveEngine.inCheck(oppSide)) {
+          moveReasons.push("check");
+        }
+        if (legalMoves.length === 1) {
+          moveReasons.push("forced");
+        }
+        if (uTo === oTo) {
+          moveReasons.push("recapture");
+        }
+        let moveConfidence = first.confidence - i * PREMOVE_CONFIG.chainConfidenceDecay;
+        if (moveReasons.includes("check"))
+          moveConfidence += 0.1;
+        if (moveReasons.includes("forced"))
+          moveConfidence += 0.15;
+        if (moveReasons.includes("recapture"))
+          moveConfidence += 0.1;
+        moveConfidence = Math.max(0, Math.min(1, moveConfidence));
+        if (moveConfidence < PREMOVE_CONFIG.minConfidence) {
+          for (let j = appliedMoves.length - 1; j >= 0; j--) {
+            premoveEngine.unmakeMove(appliedMoves[j]);
+          }
+          break;
+        }
+        chain.push({
+          uci: ourUci,
+          oppUci,
+          confidence: moveConfidence,
+          reasons: moveReasons
+        });
+      }
+      premoveEngine.loadFen(fen);
+    } catch (e) {
+      console.warn("GabiBot: evaluatePremoveChain error:", e);
+    }
+    return chain;
+  }
+  function getOurMoveFromPV(pv, ourColor, sideToMove) {
+    if (!pv)
+      return null;
+    const moves = pv.trim().split(/\s+/).filter(Boolean);
+    if (!moves.length)
+      return null;
+    return moves[sideToMove === ourColor ? 0 : 1] || null;
+  }
+  var PREMOVE_CONFIG, premoveEngine;
+  var init_premove = __esm({
+    "src/engine/premove.js"() {
+      init_local_engine();
+      init_constants();
+      init_utils2();
+      PREMOVE_CONFIG = {
+        stabilityThreshold: 150,
+        // cp — block if alt is this much better
+        minConfidence: 0.45,
+        // minimum confidence to execute
+        altMovesToCheck: 5,
+        // top opponent alternatives to test
+        quiesceMsPerMove: 40,
+        // ms budget per quiesce call
+        quiesceMsScoring: 80,
+        // ms budget for scoring all opp moves
+        maxChainDepth: 3,
+        // max premoves to queue
+        chainConfidenceDecay: 0.12
+        // confidence penalty per chain depth
+      };
+      premoveEngine = new LocalEngine();
+    }
+  });
+
+  // src/engine/san.js
+  function getEngine() {
+    if (!sanEngine)
+      sanEngine = new LocalEngine();
+    return sanEngine;
+  }
+  function uciToSan(fen, uci) {
+    if (!uci)
+      return "";
+    if (typeof uci === "object") {
+      if (typeof uci.uci === "string") {
+        uci = uci.uci;
+      } else if (typeof uci.from === "string" && typeof uci.to === "string") {
+        uci = uci.from + uci.to + (uci.promo || uci.promotion || "");
+      }
+    }
+    if (typeof uci !== "string" || uci.length < 4)
+      return uci;
+    const engine = getEngine();
+    engine.loadFen(fen);
+    const from = nameToSq(uci.substring(0, 2));
+    const to = nameToSq(uci.substring(2, 4));
+    const promo = uci.length >= 5 ? uci[4].toLowerCase() : null;
+    const moves = engine.generateLegalMoves();
+    const move = moves.find((m) => m.from === from && m.to === to && (!promo || m.flags & FLAG_PROMO));
+    if (!move)
+      return uci;
+    if (move.flags & FLAG_CASTLE) {
+      const toFile = sqFile(to);
+      if (toFile === 6)
+        return "O-O";
+      if (toFile === 2)
+        return "O-O-O";
+    }
+    const piece = engine.board[from];
+    const pieceType = Math.abs(piece);
+    const isPawn = pieceType === 1;
+    const isCapture = engine.board[to] !== 0 || move.flags & FLAG_EP;
+    let san = "";
+    if (!isPawn) {
+      san += PIECE_SYMBOLS[piece] || "";
+    }
+    if (!isPawn && moves.length > 1) {
+      const samePieceMoves = moves.filter(
+        (m) => m.to === to && m.from !== from && engine.board[m.from] === piece
+      );
+      if (samePieceMoves.length > 0) {
+        const fromFile = sqFile(from);
+        const fromRank = sqRank(from);
+        const sameFile = samePieceMoves.some((m) => sqFile(m.from) === fromFile);
+        const sameRank = samePieceMoves.some((m) => sqRank(m.from) === fromRank);
+        if (!sameFile) {
+          san += uci[0];
+        } else if (!sameRank) {
+          san += uci[1];
+        } else {
+          san += uci.substring(0, 2);
+        }
+      }
+    }
+    if (isPawn && isCapture) {
+      san += uci[0];
+    }
+    if (isCapture) {
+      san += "x";
+    }
+    san += uci.substring(2, 4);
+    if (move.flags & FLAG_PROMO && promo) {
+      san += "=" + (PROMO_SYMBOLS[promo] || promo.toUpperCase());
+    }
+    engine.makeMove(move);
+    const opponentMoves = engine.generateLegalMoves();
+    const inCheck = engine.inCheck(-engine.side);
+    if (opponentMoves.length === 0 && inCheck) {
+      san += "#";
+    } else if (inCheck) {
+      san += "+";
+    }
+    return san;
+  }
+  function getMoveNumber(fen) {
+    const parts = fen.split(" ");
+    return parseInt(parts[5]) || 1;
+  }
+  function isWhiteToMove(fen) {
+    const parts = fen.split(" ");
+    return parts[1] === "w";
+  }
+  function formatMove(fen, uci) {
+    const san = uciToSan(fen, uci);
+    const moveNum = getMoveNumber(fen);
+    const isWhite = isWhiteToMove(fen);
+    if (isWhite) {
+      return `${moveNum}. ${san}`;
+    } else {
+      return `${moveNum}... ${san}`;
+    }
+  }
+  function pvToSan(fen, pv) {
+    if (!fen || !pv)
+      return pv || "";
+    const moves = pv.trim().split(/\s+/).filter(Boolean);
+    if (moves.length === 0)
+      return "";
+    const engine = getEngine();
+    engine.loadFen(fen);
+    const sanMoves = [];
+    const appliedMoves = [];
+    for (const uci of moves) {
+      if (!uci || uci.length < 4)
+        break;
+      const from = nameToSq(uci.substring(0, 2));
+      const to = nameToSq(uci.substring(2, 4));
+      const promo = uci.length >= 5 ? uci[4].toLowerCase() : null;
+      const legalMoves = engine.generateLegalMoves();
+      const move = legalMoves.find((m) => m.from === from && m.to === to && (!promo || m.flags & FLAG_PROMO));
+      if (!move)
+        break;
+      const san = uciToSanFromEngine(engine, move, legalMoves, uci, promo);
+      sanMoves.push(san);
+      engine.makeMove(move);
+      appliedMoves.push(move);
+    }
+    for (let i = appliedMoves.length - 1; i >= 0; i--) {
+      engine.unmakeMove(appliedMoves[i]);
+    }
+    return sanMoves.join(" ");
+  }
+  function uciToSanFromEngine(engine, move, moves, uci, promo) {
+    const from = move.from;
+    const to = move.to;
+    if (move.flags & FLAG_CASTLE) {
+      const toFile = sqFile(to);
+      if (toFile === 6)
+        return "O-O";
+      if (toFile === 2)
+        return "O-O-O";
+    }
+    const piece = engine.board[from];
+    const pieceType = Math.abs(piece);
+    const isPawn = pieceType === 1;
+    const isCapture = engine.board[to] !== 0 || move.flags & FLAG_EP;
+    let san = "";
+    if (!isPawn) {
+      san += PIECE_SYMBOLS[piece] || "";
+    }
+    if (!isPawn && moves.length > 1) {
+      const samePieceMoves = moves.filter(
+        (m) => m.to === to && m.from !== from && engine.board[m.from] === piece
+      );
+      if (samePieceMoves.length > 0) {
+        const fromFile = sqFile(from);
+        const fromRank = sqRank(from);
+        const sameFile = samePieceMoves.some((m) => sqFile(m.from) === fromFile);
+        const sameRank = samePieceMoves.some((m) => sqRank(m.from) === fromRank);
+        if (!sameFile)
+          san += uci[0];
+        else if (!sameRank)
+          san += uci[1];
+        else
+          san += uci.substring(0, 2);
+      }
+    }
+    if (isPawn && isCapture)
+      san += uci[0];
+    if (isCapture)
+      san += "x";
+    san += uci.substring(2, 4);
+    if (move.flags & FLAG_PROMO && promo) {
+      san += "=" + (PROMO_SYMBOLS[promo] || promo.toUpperCase());
+    }
+    engine.makeMove(move);
+    const opponentMoves = engine.generateLegalMoves();
+    const inCheck = engine.inCheck(-engine.side);
+    if (opponentMoves.length === 0 && inCheck)
+      san += "#";
+    else if (inCheck)
+      san += "+";
+    engine.unmakeMove(move);
+    return san;
+  }
+  var PIECE_SYMBOLS, PROMO_SYMBOLS, sanEngine;
+  var init_san = __esm({
+    "src/engine/san.js"() {
+      init_local_engine();
+      init_constants();
+      init_utils2();
+      PIECE_SYMBOLS = {
+        [WN]: "N",
+        [WB]: "B",
+        [WR]: "R",
+        [WQ]: "Q",
+        [WK]: "K",
+        [BN]: "N",
+        [BB]: "B",
+        [BR]: "R",
+        [BQ]: "Q",
+        [BK]: "K"
+      };
+      PROMO_SYMBOLS = { q: "Q", r: "R", b: "B", n: "N" };
+      sanEngine = null;
+    }
+  });
+
+  // src/ui.js
+  function buildUI() {
+    const menuWrap = document.createElement("div");
+    menuWrap.id = "menuWrap";
+    const menuWrapStyle = document.createElement("style");
+    menuWrap.innerHTML = `
+  <div id="topText">
+    <a id="modTitle">\u265F GabiBot</a>
+    <button id="minimizeBtn" title="Minimize (Ctrl+B)">\u2500</button>
+  </div>
+    <div id="itemsList">
+    <div name="enableHack" class="listItem">
+      <input class="checkboxMod" type="checkbox">
+      <a class="itemDescription">Enable Bot</a>
+      <a class="itemState">Off</a>
+    </div>
+    <div name="autoMove" class="listItem">
+      <input class="checkboxMod" type="checkbox">
+      <a class="itemDescription">Auto Move</a>
+      <a class="itemState">Off</a>
+    </div>
+
+    <div name="moveMethod" class="listItem">
+      <input class="checkboxMod" type="checkbox">
+      <a class="itemDescription">Drag Move</a>
+      <a class="itemState">Off</a>
+    </div>
+
+
+    <div class="divider"></div>
+
+    <div name="premoveEnabled" class="listItem">
+      <input class="checkboxMod" type="checkbox">
+      <a class="itemDescription">Premove System</a>
+      <a class="itemState">Off</a>
+    </div>
+
+    <div class="divider"></div>
+
+    <div name="autoRematch" class="listItem">
+      <input class="checkboxMod" type="checkbox">
+      <a class="itemDescription">Auto Rematch</a>
+      <a class="itemState">Off</a>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="divider"></div>
+
+    <div name="botPower" class="listItem">
+      <input min="1" max="30" value="12" class="rangeSlider" type="range">
+      <a class="itemDescription">Depth</a>
+      <a class="itemState">12</a>
+    </div>
+    <div name="moveTime" class="listItem">
+      <!-- Mapped slider: 0-100 map to 100ms-10000ms log scale -->
+      <input min="0" max="100" value="50" class="rangeSlider" type="range">
+      <a class="itemDescription">Think</a>
+      <a class="itemState">1.0s</a>
+    </div>
+    <div name="jitter" class="listItem">
+      <input min="0" max="100" value="0" class="rangeSlider" type="range">
+      <a class="itemDescription">Jitter</a>
+      <a class="itemState">0.0s</a>
+    </div>
+
+    <div class="divider"></div>
+  </div>
+  
+  <!-- Terminal Console -->
+  <div id="consoleHeader" class="console-header">
+    <span class="console-title">Terminal</span>
+    <div class="console-actions">
+      <button id="consoleCopyBtn" title="Copy log">\u29C9</button>
+      <button id="consoleClearBtn" title="Clear log">\u2715</button>
+    </div>
+  </div>
+  <div id="consoleWindow" class="console-window">
+     <div class="log-line info">GabiBot Ready</div>
+  </div>
+`;
+    menuWrapStyle.innerHTML = `
+  #menuWrap {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    border-radius: 8px;
+    z-index: 9999999;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto; /* Header, Settings, Console */
+    width: 360px; max-height: 85vh;
+    position: fixed;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: rgba(20, 20, 20, 0.95);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    user-select: none;
+    top: 20px; right: 20px;
+    transition: opacity 0.3s ease, transform 0.3s ease;
+  }
+  #menuWrap.minimized { grid-template-rows: auto 0fr 0fr; max-height: 50px; }
+  #menuWrap.minimized #itemsList, #menuWrap.minimized #consoleWindow { overflow: hidden; opacity: 0; display: none; }
+  #menuWrap.grabbing { cursor: grabbing !important; opacity: 0.9; }
+  .divider { height: 1px; background: rgba(255, 255, 255, 0.1); margin: 10px 0; }
+  
+  #evaluationBarWrap {
+    position: absolute;
+    height: 100%;
+    width: 20px;
+    left: -28px;
+    top: 0;
+    background: #000;
+    z-index: 50;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+  }
+  #evaluationBarWhite { position: absolute; top: 0; left: 0; right: 0; background: #f0d9b5; transition: height 0.3s ease; }
+  #evaluationBarBlack { position: absolute; bottom: 0; left: 0; right: 0; background: #000; transition: height 0.3s ease; }
+  #topText { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px;
+    background: rgba(255, 255, 255, 0.05); border-bottom: 1px solid rgba(255, 255, 255, 0.05); cursor: move; }
+  #modTitle { color: #fff; font-size: 16px; font-weight: 600; letter-spacing: 0.5px; }
+  #minimizeBtn { background: rgba(255, 255, 255, 0.1); border: none; color: #fff; width: 24px; height: 24px;
+    border-radius: 4px; cursor: pointer; font-size: 14px; transition: background 0.2s; }
+  #minimizeBtn:hover { background: rgba(255, 255, 255, 0.2); }
+  #itemsList { overflow-y: auto; overflow-x: hidden; padding: 12px 16px; display: flex; flex-direction: column; height: 100%; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: rgba(255, 255, 255, 0.05); }
+  ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+  .listItem { display: flex; align-items: center; margin-bottom: 12px; gap: 8px; flex-shrink: 0; }
+  .checkboxMod { appearance: none; width: 18px; height: 18px; border: 2px solid rgba(255, 255, 255, 0.3); border-radius: 4px;
+    background: rgba(255, 255, 255, 0.05); cursor: pointer; position: relative; transition: all 0.2s; flex-shrink: 0; }
+  .checkboxMod:checked { background: #4CAF50; border-color: #4CAF50; }
+  .checkboxMod:checked::after { content: "\u2713"; position: absolute; color: white; font-size: 12px; top: 50%; left: 50%; transform: translate(-50%, -50%); }
+  .rangeSlider { -webkit-appearance: none; flex: 1; height: 4px; border-radius: 2px; background: rgba(255, 255, 255, 0.1); outline: none; }
+  .rangeSlider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #4CAF50; cursor: pointer; transition: transform 0.2s; }
+  .rangeSlider::-webkit-slider-thumb:hover { transform: scale(1.2); }
+  .itemDescription { color: rgba(255, 255, 255, 0.7); font-size: 12px; flex: 1; }
+  .itemState { color: #fff; font-size: 12px; min-width: 35px; text-align: right; font-weight: 500; }
+  #arrowCanvas { position: absolute !important; top: 0 !important; left: 0 !important; width: 100% !important; height: 100% !important; pointer-events: none !important; z-index: 100 !important; }
+
+  /* Console Header */
+  .console-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 4px 10px;
+    background: rgba(0, 0, 0, 0.25);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    flex-shrink: 0;
+  }
+  .console-title { color: rgba(255,255,255,0.4); font-size: 10px; font-family: monospace; letter-spacing: 0.5px; text-transform: uppercase; }
+  .console-actions { display: flex; gap: 4px; }
+  .console-actions button {
+    background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.1);
+    color: rgba(255,255,255,0.5); width: 20px; height: 20px; border-radius: 3px;
+    cursor: pointer; font-size: 11px; padding: 0; line-height: 1;
+    transition: background 0.15s, color 0.15s;
+  }
+  .console-actions button:hover { background: rgba(255,255,255,0.15); color: #fff; }
+  #consoleCopyBtn.copied { color: #4CAF50; border-color: #4CAF50; }
+  /* Console Window Styles - Edge to Edge */
+  .console-window {
+    background: rgba(0, 0, 0, 0.3);
+    padding: 12px;
+    min-height: 80px;
+    max-height: 150px;
+    overflow-y: auto;
+    font-family: "Consolas", "Monaco", "Courier New", monospace;
+    font-size: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    border-radius: 0 0 8px 8px;
+  }
+  .log-line { color: #bbb; line-height: 1.5; word-break: break-all; }
+  .log-line.status { color: #4CAF50; font-weight: bold; }
+  .log-line.error { color: #ff5252; }
+  .log-line.warn { color: #ffab40; }
+  .log-line.info { color: #81d4fa; }
+  .log-line.move { color: #64B5F6; }
+  .log-line.opponent { color: #FFB74D; }
+`;
+    document.body.appendChild(menuWrap);
+    document.body.appendChild(menuWrapStyle);
+    ui.menuWrap = menuWrap;
+    const saved = Settings.load();
+    if (saved?.menuPosition) {
+      menuWrap.style.top = saved.menuPosition.top || "20px";
+      menuWrap.style.left = saved.menuPosition.left || "";
+      menuWrap.style.right = saved.menuPosition.left ? "auto" : "20px";
+    }
+    const getElementByName = (name, el) => el.querySelector(`[name="${name}"]`);
+    const getInputElement = (el) => el.children[0];
+    const getStateElement = (el) => el.children[el.children.length - 1];
+    function bindControl(name, type, variable) {
+      const modElement = getElementByName(name, menuWrap);
+      if (!modElement)
+        return;
+      const modState = getStateElement(modElement);
+      const modInput = getInputElement(modElement);
+      const key = variable.replace("BotState.", "");
+      if (type === "checkbox") {
+        modInput.checked = !!BotState[key];
+        modState.textContent = BotState[key] ? "On" : "Off";
+        if (name === "moveMethod") {
+          modInput.checked = BotState[key] === "drag";
+          modState.textContent = BotState[key] === "drag" ? "On" : "Off";
+        }
+        modInput.addEventListener("input", () => {
+          if (name === "moveMethod") {
+            BotState[key] = modInput.checked ? "drag" : "click";
+            modState.textContent = BotState[key] === "drag" ? "On" : "Off";
+          } else {
+            BotState[key] = modInput.checked ? 1 : 0;
+            modState.textContent = BotState[key] ? "On" : "Off";
+          }
+          Settings.save();
+        });
+      } else if (type === "range") {
+        const toLog = (v) => Math.round(100 * Math.pow(100, v / 100));
+        const toLin = (v) => Math.log(v / 100) / Math.log(100) * 100;
+        if (name === "moveTime") {
+          modInput.value = toLin(BotState.moveTime);
+          modState.textContent = (BotState.moveTime / 1e3).toFixed(1) + "s";
+          modInput.addEventListener("input", () => {
+            const val = parseInt(modInput.value, 10);
+            const timeMs = toLog(val);
+            BotState.moveTime = timeMs;
+            modState.textContent = (timeMs / 1e3).toFixed(1) + "s";
+            Settings.save();
+          });
+        } else if (name === "jitter") {
+          const toLogJitter = (v) => {
+            if (v === 0)
+              return 0;
+            return Math.round(100 * Math.pow(100, v / 100));
+          };
+          const toLinJitter = (v) => {
+            if (v <= 0)
+              return 0;
+            return Math.log(v / 100) / Math.log(100) * 100;
+          };
+          modInput.value = toLinJitter(BotState.jitter);
+          modState.textContent = (BotState.jitter / 1e3).toFixed(1) + "s";
+          modInput.addEventListener("input", () => {
+            const val = parseInt(modInput.value, 10);
+            const timeMs = toLogJitter(val);
+            BotState.jitter = timeMs;
+            modState.textContent = (timeMs / 1e3).toFixed(1) + "s";
+            Settings.save();
+          });
+        } else {
+          modInput.value = BotState[key];
+          modState.textContent = BotState[key];
+          modInput.addEventListener("input", () => {
+            let value = parseInt(modInput.value, 10);
+            const min = parseInt(modInput.min, 10);
+            const max = parseInt(modInput.max, 10);
+            value = Math.max(min, Math.min(max, value));
+            BotState[key] = value;
+            modInput.value = value;
+            modState.textContent = value;
+            Settings.save();
+          });
+        }
+      }
+    }
+    bindControl("enableHack", "checkbox", "BotState.hackEnabled");
+    bindControl("autoMove", "checkbox", "BotState.autoMove");
+    bindControl("moveMethod", "checkbox", "BotState.moveMethod");
+    bindControl("botPower", "range", "BotState.botPower");
+    bindControl("moveTime", "range", "BotState.moveTime");
+    bindControl("jitter", "range", "BotState.jitter");
+    bindControl("premoveEnabled", "checkbox", "BotState.premoveEnabled");
+    bindControl("autoRematch", "checkbox", "BotState.autoRematch");
+    makePanelDraggable(menuWrap);
+    document.getElementById("minimizeBtn").addEventListener("click", () => menuWrap.classList.toggle("minimized"));
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "b" && e.ctrlKey) {
+        e.preventDefault();
+        menuWrap.classList.toggle("minimized");
+      }
+    });
+    document.getElementById("consoleClearBtn").addEventListener("click", () => ui.clearConsole());
+    document.getElementById("consoleCopyBtn").addEventListener("click", () => {
+      const consoleEl = menuWrap.querySelector("#consoleWindow");
+      if (!consoleEl)
+        return;
+      const text = Array.from(consoleEl.querySelectorAll(".log-line")).map((l) => l.textContent.trim()).join("\n");
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById("consoleCopyBtn");
+        btn.classList.add("copied");
+        btn.title = "Copied!";
+        setTimeout(() => {
+          btn.classList.remove("copied");
+          btn.title = "Copy log";
+        }, 1500);
+      }).catch(() => {
+      });
+    });
+  }
+  function makePanelDraggable(panel) {
+    function clampToViewport() {
+      const rect = panel.getBoundingClientRect();
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const margin = 8;
+      panel.style.right = "auto";
+      let left = parseFloat(panel.style.left || rect.left);
+      let top = parseFloat(panel.style.top || rect.top);
+      left = Math.max(margin, Math.min(left, vw - rect.width - margin));
+      top = Math.max(margin, Math.min(top, vh - rect.height - margin));
+      panel.style.left = left + "px";
+      panel.style.top = top + "px";
+    }
+    function allowDragFromTarget(target, e) {
+      if (e.altKey)
+        return true;
+      const rect = panel.getBoundingClientRect();
+      const m = 14;
+      const nearEdge = e.clientX <= rect.left + m || e.clientX >= rect.right - m || e.clientY <= rect.top + m || e.clientY >= rect.bottom - m;
+      if (nearEdge)
+        return true;
+      if (target.closest("input, select, textarea, button, label, a"))
+        return false;
+      return true;
+    }
+    function startDrag(e) {
+      e.preventDefault();
+      const startRect = panel.getBoundingClientRect();
+      panel.classList.add("grabbing");
+      panel.style.right = "auto";
+      panel.style.left = startRect.left + "px";
+      panel.style.top = startRect.top + "px";
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const move = (ev) => {
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        let newLeft = startRect.left + dx;
+        let newTop = startRect.top + dy;
+        const margin = 8;
+        const maxLeft = Math.max(margin, vw - startRect.width - margin);
+        const maxTop = Math.max(margin, vh - startRect.height - margin);
+        newLeft = Math.min(Math.max(newLeft, margin), maxLeft);
+        newTop = Math.min(Math.max(newTop, margin), maxTop);
+        panel.style.left = newLeft + "px";
+        panel.style.top = newTop + "px";
+      };
+      const up = () => {
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+        panel.classList.remove("grabbing");
+        try {
+          Settings.save();
+        } catch {
+        }
+      };
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    }
+    panel.addEventListener("mousedown", (e) => {
+      if (e.button !== 0)
+        return;
+      if (!allowDragFromTarget(e.target, e))
+        return;
+      startDrag(e);
+    });
+    window.addEventListener("resize", clampToViewport);
+    setTimeout(clampToViewport, 50);
+  }
+  var ui;
+  var init_ui = __esm({
+    "src/ui.js"() {
+      init_state();
+      init_utils();
+      init_board();
+      init_san();
+      ui = {
+        menuWrap: null,
+        consoleEl: null,
+        lastStatus: "",
+        lastBestMove: "",
+        moveNumber: 0,
+        lastMoveColor: null,
+        log(msg, type = "info") {
+          if (!this.consoleEl && this.menuWrap) {
+            this.consoleEl = this.menuWrap.querySelector("#consoleWindow");
+          }
+          if (!this.consoleEl)
+            return;
+          const line = document.createElement("div");
+          line.className = `log-line ${type}`;
+          line.textContent = msg;
+          this.consoleEl.appendChild(line);
+          while (this.consoleEl.childElementCount > 100) {
+            this.consoleEl.removeChild(this.consoleEl.firstChild);
+          }
+          this.consoleEl.scrollTop = this.consoleEl.scrollHeight;
+        },
+        clearConsole() {
+          if (!this.consoleEl && this.menuWrap) {
+            this.consoleEl = this.menuWrap.querySelector("#consoleWindow");
+          }
+          if (!this.consoleEl)
+            return;
+          this.consoleEl.innerHTML = "";
+          this.lastStatus = "";
+          this.lastBestMove = "";
+          this.moveNumber = 0;
+          this.lastMoveColor = null;
+        },
+        updateDisplay(playingAs) {
+          if (BotState.statusInfo !== this.lastStatus) {
+            const blocked = [
+              "Making move...",
+              "Move made",
+              "Waiting for opponent",
+              "Ready",
+              "Analyzing...",
+              "Analyzing (premove)",
+              "Pondering",
+              "Move canceled",
+              "Manual move",
+              "Premove unavailable",
+              "Premove skipped"
+            ];
+            const isBlocked = blocked.some((s) => BotState.statusInfo.includes(s));
+            if (!isBlocked) {
+              this.log(BotState.statusInfo, "status");
+            }
+            this.lastStatus = BotState.statusInfo;
+          }
+          if (BotState.bestMove !== "-" && BotState.bestMove !== this.lastBestMove) {
+            let msg = `Eval: ${BotState.currentEvaluation}`;
+            if (BotState.principalVariation && BotState.principalVariation !== "-" && BotState.principalVariation !== "Not available") {
+              try {
+                const game = getGame();
+                const fen = game ? getFen(game) : null;
+                const sanPv = fen ? pvToSan(fen, BotState.principalVariation) : BotState.principalVariation;
+                msg += ` | PV: ${sanPv}`;
+              } catch {
+                msg += ` | PV: ${BotState.principalVariation}`;
+              }
+            } else {
+              msg += ` | Best: ${BotState.bestMove}`;
+            }
+            this.log(msg, "info");
+            this.lastBestMove = BotState.bestMove;
+          }
+          updateEvaluationBar(BotState.currentEvaluation, playingAs);
+        },
+        Settings
+      };
+    }
+  });
+
+  // src/engine/scheduler.js
+  var scheduler_exports = {};
+  __export(scheduler_exports, {
+    clearPremoveChain: () => clearPremoveChain,
+    getLastFenProcessedMain: () => getLastFenProcessedMain,
+    getLastFenProcessedPremove: () => getLastFenProcessedPremove,
+    getPremoveChain: () => getPremoveChain,
+    scheduleAnalysis: () => scheduleAnalysis,
+    setLastFenProcessedMain: () => setLastFenProcessedMain,
+    setLastFenProcessedPremove: () => setLastFenProcessedPremove,
+    tryChainPremove: () => tryChainPremove
+  });
+  function getLastFenProcessedMain() {
+    return lastFenProcessedMain;
+  }
+  function setLastFenProcessedMain(fen) {
+    lastFenProcessedMain = fen;
+  }
+  function getLastFenProcessedPremove() {
+    return lastFenProcessedPremove;
+  }
+  function setLastFenProcessedPremove(fen) {
+    lastFenProcessedPremove = fen;
+  }
+  function getPremoveChain() {
+    return premoveChain;
+  }
+  function clearPremoveChain() {
+    premoveChain = [];
+    chainBaseFen = "";
+  }
+  async function tryChainPremove(currentFen, tickCallback) {
+    if (premoveChain.length === 0)
+      return false;
+    const next = premoveChain[0];
+    const result = evaluatePremove(currentFen, next.oppUci, next.uci, getPlayerColor(getGame()));
+    if (!result.execute) {
+      clearPremoveChain();
+      return false;
+    }
+    premoveChain.shift();
+    const from = next.uci.substring(0, 2);
+    const to = next.uci.substring(2, 4);
+    clearArrows();
+    drawArrow(from, to, "rgba(80, 180, 255, 0.7)", 3);
+    if (BotState.moveMethod === "drag") {
+      await simulateDragMove(from, to);
+    } else {
+      await simulateClickMove(from, to);
+    }
+    await sleep(80);
+    BotState.statusInfo = `\u2705 Chain premove: ${next.uci} (${premoveChain.length} queued)`;
+    if (BotState.onUpdateDisplay)
+      BotState.onUpdateDisplay(pa());
+    return true;
+  }
+  function scheduleAnalysis(kind, fen, tickCallback) {
+    if (kind === "main" && scheduledMainFen === fen)
+      return;
+    if (kind !== "main" && scheduledPremoveFen === fen)
+      return;
+    if (kind === "main")
+      scheduledMainFen = fen;
+    else
+      scheduledPremoveFen = fen;
+    const analysisId = ++currentAnalysisId;
+    if (currentAbortController) {
+      currentAbortController.abort("superseded");
+      currentAbortController = null;
+    }
+    const ctrl = new AbortController();
+    currentAbortController = ctrl;
+    const run = async () => {
+      if (analysisId !== currentAnalysisId || !BotState.hackEnabled)
+        return;
+      invalidateGameCache();
+      const game = getGame();
+      if (!game)
+        return;
+      if (kind === "main" && lastFenProcessedMain === fen)
+        return;
+      if (kind !== "main" && lastFenProcessedPremove === fen)
+        return;
+      try {
+        BotState.statusInfo = kind === "main" ? "\u{1F504} Analyzing..." : BotState.premoveEnabled ? "\u{1F504} Analyzing (premove)..." : "\u{1F504} Pondering...";
+        if (BotState.onUpdateDisplay)
+          BotState.onUpdateDisplay(pa());
+        const targetDepth = BotState.botPower || 12;
+        if (analysisId !== currentAnalysisId) {
+          ctrl.abort("superseded");
+          return;
+        }
+        const data = await getAnalysis(fen, targetDepth, BotState.moveTime, ctrl.signal);
+        if (analysisId !== currentAnalysisId)
+          return;
+        const best = parseBestLine(data);
+        if (kind === "main") {
+          if (!best) {
+            throw new Error("No valid move found by engine.");
+          }
+          consecutiveFailures = 0;
+          BotState.bestMove = best?.uci || "-";
+          BotState.currentEvaluation = scoreToDisplay(best?.score);
+          BotState.principalVariation = best?.pv || "Not available";
+          BotState.statusInfo = `\u2713 Ready (D${data.depth || "?"})`;
+          if (BotState.onUpdateDisplay)
+            BotState.onUpdateDisplay(pa());
+          const game2 = getGame();
+          const currentFen = getFen(game2);
+          if (currentFen) {
+            ui.log(formatMove(currentFen, best.uci), "move");
+          }
+          clearPremoveChain();
+          if (best) {
+            const from = best.uci.substring(0, 2);
+            const to = best.uci.substring(2, 4);
+            const promo = best.uci.length >= 5 ? best.uci[4] : null;
+            clearArrows();
+            drawArrow(from, to, "rgba(100, 255, 100, 0.7)", 3);
+            await executeMove(from, to, fen, promo, data.depth, tickCallback);
+          }
+          lastFenProcessedMain = fen;
+        } else {
+          consecutiveFailures = 0;
+          const ourColor = getPlayerColor(game);
+          const stm = getSideToMove(game);
+          const pvMoves = (best?.pv || "").trim().split(/\s+/).filter(Boolean);
+          const opponentUci = stm !== ourColor && pvMoves.length > 0 ? pvMoves[0] : null;
+          const ourUci = getOurMoveFromPV(best?.pv || "", ourColor, stm) || (stm === ourColor ? best?.uci || null : null);
+          if (!ourUci) {
+            BotState.statusInfo = BotState.premoveEnabled ? `Premove unavailable (no PV)` : `Pondering... (D${data.depth})`;
+            if (BotState.onUpdateDisplay)
+              BotState.onUpdateDisplay(pa());
+            lastFenProcessedPremove = fen;
+            return;
+          }
+          if (!BotState.premoveEnabled) {
+            BotState.statusInfo = `Pondering... (D${data.depth})`;
+            if (BotState.onUpdateDisplay)
+              BotState.onUpdateDisplay(pa());
+            lastFenProcessedPremove = fen;
+            return;
+          }
+          const chain = evaluatePremoveChain(fen, best?.pv || "", ourColor, stm);
+          if (chain.length === 0) {
+            const premoveResult = evaluatePremove(fen, opponentUci, ourUci, ourColor);
+            if (premoveResult.blocked) {
+              const san = uciToSan(fen, ourUci);
+              ui.log(`\u26A0 Premove ${san} blocked: ${premoveResult.blocked}`, "warn");
+              lastFenProcessedPremove = fen;
+              return;
+            }
+            if (!premoveResult.execute) {
+              lastFenProcessedPremove = fen;
+              return;
+            }
+            const from2 = ourUci.substring(0, 2);
+            const to2 = ourUci.substring(2, 4);
+            clearArrows();
+            drawArrow(from2, to2, "rgba(80, 180, 255, 0.7)", 3);
+            if (BotState.moveMethod === "drag") {
+              await simulateDragMove(from2, to2);
+            } else {
+              await simulateClickMove(from2, to2);
+            }
+            await sleep(80);
+            ui.log(`\u26A1 ${formatMove(fen, ourUci)}`, "move");
+            lastFenProcessedPremove = fen;
+            return;
+          }
+          const firstMove = chain[0];
+          premoveChain = chain.slice(1);
+          chainBaseFen = fen;
+          const from = firstMove.uci.substring(0, 2);
+          const to = firstMove.uci.substring(2, 4);
+          clearArrows();
+          drawArrow(from, to, "rgba(80, 180, 255, 0.7)", 3);
+          for (let i = 0; i < premoveChain.length; i++) {
+            const qm = premoveChain[i];
+            const qFrom = qm.uci.substring(0, 2);
+            const qTo = qm.uci.substring(2, 4);
+            const opacity = Math.max(0.2, 0.5 - i * 0.15);
+            drawArrow(qFrom, qTo, `rgba(80, 180, 255, ${opacity})`, 2);
+          }
+          if (BotState.moveMethod === "drag") {
+            await simulateDragMove(from, to);
+          } else {
+            await simulateClickMove(from, to);
+          }
+          await sleep(80);
+          ui.log(`\u26A1 ${formatMove(fen, firstMove.uci)}`, "move");
+          lastFenProcessedPremove = fen;
+        }
+      } catch (error) {
+        if (String(error?.name || error).toLowerCase().includes("abort") || String(error?.message || error).toLowerCase().includes("superseded")) {
+        } else {
+          console.error("GabiBot Error:", error);
+          consecutiveFailures++;
+          if (consecutiveFailures <= MAX_FAILURES) {
+            BotState.statusInfo = `\u274C Error - Retrying (${consecutiveFailures}/${MAX_FAILURES})...`;
+            BotState.currentEvaluation = "Error";
+            if (BotState.onUpdateDisplay)
+              BotState.onUpdateDisplay(pa());
+            if (kind === "main" && scheduledMainFen === fen)
+              scheduledMainFen = "";
+            else if (kind !== "main" && scheduledPremoveFen === fen)
+              scheduledPremoveFen = "";
+            setTimeout(() => {
+              resetEngine();
+              if (kind === "main" && lastFenProcessedMain === fen)
+                lastFenProcessedMain = "";
+              else if (kind !== "main" && lastFenProcessedPremove === fen)
+                lastFenProcessedPremove = "";
+              scheduleAnalysis(kind, fen, tickCallback);
+            }, 1e3);
+          } else {
+            BotState.statusInfo = "\u274C Engine Failed (Max Retries)";
+            BotState.currentEvaluation = "Error";
+            if (BotState.onUpdateDisplay)
+              BotState.onUpdateDisplay(pa());
+          }
+        }
+      } finally {
+        if (kind === "main" && scheduledMainFen === fen)
+          scheduledMainFen = "";
+        else if (kind !== "main" && scheduledPremoveFen === fen)
+          scheduledPremoveFen = "";
+        if (currentAbortController === ctrl)
+          currentAbortController = null;
+      }
+    };
+    run();
+  }
+  var consecutiveFailures, MAX_FAILURES, currentAnalysisId, currentAbortController, lastFenProcessedMain, lastFenProcessedPremove, premoveChain, chainBaseFen, scheduledMainFen, scheduledPremoveFen;
+  var init_scheduler = __esm({
+    "src/engine/scheduler.js"() {
+      init_state();
+      init_utils();
+      init_board();
+      init_analysis();
+      init_premove();
+      init_ui();
+      init_san();
+      consecutiveFailures = 0;
+      MAX_FAILURES = 3;
+      currentAnalysisId = 0;
+      currentAbortController = null;
+      lastFenProcessedMain = "";
+      lastFenProcessedPremove = "";
+      premoveChain = [];
+      chainBaseFen = "";
+      scheduledMainFen = "";
+      scheduledPremoveFen = "";
+    }
+  });
+
+  // src/board.js
+  function attachToBoard(boardEl) {
+    invalidateGameCache();
+    detachFromBoard();
+    if (!boardEl) {
+      console.warn("GabiBot: No board element to attach.");
+      return;
+    }
+    if (getComputedStyle(boardEl).position === "static")
+      boardEl.style.position = "relative";
+    const drawingBoard = document.createElement("canvas");
+    drawingBoard.id = "arrowCanvas";
+    drawingBoard.style.cssText = "position:absolute;top:0;left:0;pointer-events:none;z-index:100;";
+    const ctx = drawingBoard.getContext("2d");
+    const evalBarWrap = document.createElement("div");
+    evalBarWrap.id = "evaluationBarWrap";
+    const whiteBar = document.createElement("div");
+    whiteBar.id = "evaluationBarWhite";
+    const blackBar = document.createElement("div");
+    blackBar.id = "evaluationBarBlack";
+    evalBarWrap.appendChild(whiteBar);
+    evalBarWrap.appendChild(blackBar);
+    boardEl.appendChild(evalBarWrap);
+    boardEl.appendChild(drawingBoard);
+    const resizeCanvas = () => {
+      const rect = boardEl.getBoundingClientRect();
+      drawingBoard.width = rect.width;
+      drawingBoard.height = rect.height;
+    };
+    resizeCanvas();
+    const ro = new ResizeObserver(resizeCanvas);
+    ro.observe(boardEl);
+    const cancelPendingOnUserAction = () => {
+      if (pendingMoveTimeoutId) {
+        clearTimeout(pendingMoveTimeoutId);
+        pendingMoveTimeoutId = null;
+        BotState.statusInfo = "Manual move in progress...";
+        if (BotState.onUpdateDisplay)
+          BotState.onUpdateDisplay(pa());
+      }
+    };
+    const touchOpts = { passive: true, capture: true };
+    boardEl.addEventListener("mousedown", cancelPendingOnUserAction, true);
+    boardEl.addEventListener("touchstart", cancelPendingOnUserAction, touchOpts);
+    boardCtx = {
+      boardEl,
+      drawingBoard,
+      ctx,
+      evalBarWrap,
+      resizeObserver: ro,
+      cancelPendingOnUserAction,
+      touchOpts,
+      detachListeners() {
+        try {
+          boardEl.removeEventListener("mousedown", cancelPendingOnUserAction, true);
+        } catch {
+        }
+        try {
+          boardEl.removeEventListener("touchstart", cancelPendingOnUserAction, touchOpts);
+        } catch {
+        }
+        try {
+          ro.disconnect();
+        } catch {
+        }
+        try {
+          drawingBoard.remove();
+        } catch {
+        }
+        try {
+          evalBarWrap.remove();
+        } catch {
+        }
+      }
+    };
+    if (BotState.onUpdateDisplay)
+      BotState.onUpdateDisplay(pa());
+    if (boardMoveObserver) {
+      stopMoveWatcher();
+      startMoveWatcher();
+    }
+  }
+  function detachFromBoard() {
+    if (!boardCtx)
+      return;
+    try {
+      boardCtx.detachListeners();
+    } catch {
+    }
+    boardCtx = null;
+  }
+  function startDomBoardWatcher() {
+    if (domObserver)
+      try {
+        domObserver.disconnect();
+      } catch {
+      }
+    domObserver = new MutationObserver(debounce(() => {
+      const newBoard = document.querySelector("chess-board") || document.querySelector(".board") || document.querySelector('[class*="board"]');
+      if (!newBoard)
+        return;
+      if (!boardCtx || boardCtx.boardEl !== newBoard) {
+        attachToBoard(newBoard);
+      }
+    }, 200));
+    domObserver.observe(document.body, { childList: true, subtree: true });
+  }
+  function onBoardMutation(cb) {
+    mutationListeners.add(cb);
+    return () => mutationListeners.delete(cb);
+  }
+  function startMoveWatcher() {
+    stopMoveWatcher();
+    const game = getGame();
+    const board = game && (document.querySelector("chess-board") || document.querySelector(".board"));
+    if (!board)
+      return;
+    boardMoveObserver = new MutationObserver(() => {
+      if (debounceTimer)
+        return;
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        invalidateGameCache();
+        mutationListeners.forEach((cb) => cb());
+      }, 80);
+    });
+    boardMoveObserver.observe(board, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "style", "data-piece"]
+    });
+  }
+  function stopMoveWatcher() {
+    if (boardMoveObserver) {
+      boardMoveObserver.disconnect();
+      boardMoveObserver = null;
+    }
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+  }
+  function clearArrows() {
+    if (!boardCtx)
+      return;
+    const { drawingBoard, ctx } = boardCtx;
+    ctx.clearRect(0, 0, drawingBoard.width, drawingBoard.height);
+  }
+  function getSquareCenterClientXY(square) {
+    if (!boardCtx || !square || square.length < 2)
+      return null;
+    const file = "abcdefgh".indexOf(square[0]);
+    const rank = parseInt(square[1], 10);
+    if (file < 0 || isNaN(rank))
+      return null;
+    const el = boardCtx.boardEl;
+    const rect = el.getBoundingClientRect();
+    const size = Math.min(rect.width, rect.height);
+    const tile = size / 8;
+    const offsetX = rect.left + (rect.width - size) / 2;
+    const offsetY = rect.top + (rect.height - size) / 2;
+    let x = file, y = 8 - rank;
+    if (isBoardFlipped()) {
+      x = 7 - x;
+      y = 7 - y;
+    }
+    const result = { x: offsetX + (x + 0.5) * tile, y: offsetY + (y + 0.5) * tile };
+    if (isNaN(result.x) || isNaN(result.y)) {
+      console.warn(`GabiBot: Invalid coordinates for square ${square}. Board size: ${rect.width}x${rect.height}`);
+      return null;
+    }
+    return result;
+  }
+  function getSquareCenterCanvasXY(square) {
+    if (!boardCtx || !square || square.length < 2)
+      return null;
+    const p = getSquareCenterClientXY(square);
+    if (!p)
+      return null;
+    const rect = boardCtx.boardEl.getBoundingClientRect();
+    return { x: p.x - rect.left, y: p.y - rect.top };
+  }
+  function drawArrow(uciFrom, uciTo, color, thickness) {
+    if (!boardCtx || !uciFrom || !uciTo || uciFrom.length < 2 || uciTo.length < 2)
+      return;
+    const { drawingBoard, ctx } = boardCtx;
+    const a = getSquareCenterCanvasXY(uciFrom);
+    const b = getSquareCenterCanvasXY(uciTo);
+    if (!a || !b)
+      return;
+    const size = Math.min(drawingBoard.width, drawingBoard.height);
+    const tile = size / 8;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.lineWidth = thickness;
+    ctx.strokeStyle = color;
+    ctx.lineCap = "round";
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(a.x, a.y, tile / 7, 0, 2 * Math.PI);
+    ctx.fillStyle = color.replace("0.7", "0.3");
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, tile / 5, 0, 2 * Math.PI);
+    ctx.fillStyle = color.replace("0.7", "0.5");
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+  function dispatchPointerOrMouse(el, type, opts, usePointer) {
+    if (!el)
+      return;
+    if (usePointer) {
+      try {
+        el.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, ...opts }));
+        return;
+      } catch {
+      }
+    }
+    el.dispatchEvent(new MouseEvent(type.replace("pointer", "mouse"), { bubbles: true, cancelable: true, composed: true, ...opts }));
+  }
+  function getTargetAt(x, y) {
+    return document.elementFromPoint(x, y) || boardCtx?.boardEl || document.body;
+  }
+  function getMoveCoordinates(from, to) {
+    const a = getSquareCenterClientXY(from);
+    const b = getSquareCenterClientXY(to);
+    if (!a || !b)
+      return null;
+    return { a, b };
+  }
+  function createPointerOpts(x, y, buttons) {
+    return {
+      clientX: x,
+      clientY: y,
+      buttons,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true,
+      bubbles: true,
+      cancelable: true,
+      composed: true
+    };
+  }
+  async function simulateClickMove(from, to) {
+    const coords = getMoveCoordinates(from, to);
+    if (!coords)
+      return false;
+    const { a, b } = coords;
+    const usePointer = !!window.PointerEvent;
+    const startEl = getTargetAt(a.x, a.y);
+    const endEl = getTargetAt(b.x, b.y);
+    const downStart = createPointerOpts(a.x, a.y, 1);
+    const upStart = createPointerOpts(a.x, a.y, 0);
+    const downEnd = createPointerOpts(b.x, b.y, 1);
+    const upEnd = createPointerOpts(b.x, b.y, 0);
+    dispatchPointerOrMouse(startEl, usePointer ? "pointerdown" : "mousedown", downStart, usePointer);
+    await sleep(2);
+    dispatchPointerOrMouse(startEl, usePointer ? "pointerup" : "mouseup", upStart, usePointer);
+    startEl.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, composed: true, clientX: a.x, clientY: a.y }));
+    await sleep(4);
+    dispatchPointerOrMouse(endEl, usePointer ? "pointerdown" : "mousedown", downEnd, usePointer);
+    await sleep(2);
+    dispatchPointerOrMouse(endEl, usePointer ? "pointerup" : "mouseup", upEnd, usePointer);
+    endEl.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, composed: true, clientX: b.x, clientY: b.y }));
+    return true;
+  }
+  async function simulateDragMove(from, to) {
+    const coords = getMoveCoordinates(from, to);
+    if (!coords)
+      return false;
+    const { a, b } = coords;
+    const usePointer = !!window.PointerEvent;
+    const startEl = getTargetAt(a.x, a.y);
+    const down = createPointerOpts(a.x, a.y, 1);
+    dispatchPointerOrMouse(startEl, usePointer ? "pointerdown" : "mousedown", down, usePointer);
+    await sleep(20);
+    const steps = 10;
+    for (let i = 1; i <= steps; i++) {
+      const t = i / steps;
+      const mx = a.x + (b.x - a.x) * t;
+      const my = a.y + (b.y - a.y) * t;
+      const stepTarget = getTargetAt(mx, my);
+      const moveOpts = createPointerOpts(mx, my, 1);
+      dispatchPointerOrMouse(stepTarget, usePointer ? "pointermove" : "mousemove", moveOpts, usePointer);
+      await sleep(12);
+    }
+    const endEl = getTargetAt(b.x, b.y);
+    const up = createPointerOpts(b.x, b.y, 0);
+    dispatchPointerOrMouse(endEl, usePointer ? "pointerup" : "mouseup", up, usePointer);
+    return true;
+  }
+  async function waitForFenChange(prevFen, timeout = 1e3) {
+    return new Promise((resolve) => {
+      let g = getGame();
+      let fen = g?.getFEN ? g.getFEN() : null;
+      if (fen && fen !== prevFen)
+        return resolve(true);
+      const start = performance.now();
+      let resolved = false;
+      const cleanup = onBoardMutation(() => {
+        if (resolved)
+          return;
+        g = getGame();
+        fen = g?.getFEN ? g.getFEN() : null;
+        if (fen && fen !== prevFen) {
+          resolved = true;
+          resolve(true);
+        }
+      });
+      const check = () => {
+        if (resolved)
+          return;
+        g = getGame();
+        fen = g?.getFEN ? g.getFEN() : null;
+        if (fen && fen !== prevFen) {
+          resolved = true;
+          cleanup();
+          return resolve(true);
+        }
+        if (performance.now() - start > timeout) {
+          resolved = true;
+          cleanup();
+          return resolve(false);
+        }
+        requestAnimationFrame(check);
+      };
+      requestAnimationFrame(check);
+    });
+  }
+  async function maybeSelectPromotion(prefer = "q") {
+    const preferList = (prefer ? [prefer] : ["q", "r", "b", "n"]).map((c) => c.toLowerCase());
+    const getCandidates = () => Array.from(document.querySelectorAll('[data-test-element*="promotion"], [class*="promotion"] [class*="piece"], [class*="promotion"] button, .promotion-piece'));
+    const tryClick = (el) => {
+      try {
+        el.click?.();
+        el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const start = Date.now();
+    while (Date.now() - start < 1e3) {
+      const nodes = getCandidates();
+      if (nodes.length) {
+        for (const pref of preferList) {
+          const match = nodes.find(
+            (n) => (n.dataset?.piece?.toLowerCase?.() || "") === pref || (n.getAttribute?.("data-piece") || "").toLowerCase() === pref || (n.getAttribute?.("aria-label") || "").toLowerCase().includes(pref) || (n.className || "").toLowerCase().includes(pref) || (n.textContent || "").toLowerCase().includes(pref)
+          );
+          if (match && tryClick(match))
+            return true;
+        }
+        if (tryClick(nodes[0]))
+          return true;
+      }
+      await sleep(60);
+    }
+    return false;
+  }
+  function cancelPendingMove() {
+    if (pendingMoveTimeoutId) {
+      clearTimeout(pendingMoveTimeoutId);
+      pendingMoveTimeoutId = null;
+    }
+  }
+  async function makeMove(from, to, expectedFen, promotionChar) {
+    const game = getGame();
+    if (!game || !BotState.autoMove)
+      return false;
+    const beforeFen = getFen(game);
+    if (!beforeFen || beforeFen !== expectedFen || !isPlayersTurn(game))
+      return false;
+    if (BotState.moveMethod === "drag") {
+      const dragged = await simulateDragMove(from, to);
+      if (!dragged)
+        return false;
+    } else {
+      await simulateClickMove(from, to);
+    }
+    if (promotionChar)
+      await maybeSelectPromotion(String(promotionChar).toLowerCase());
+    const changed = await waitForFenChange(beforeFen, 2500);
+    return !!changed;
+  }
+  function executeMove(from, to, analysisFen, promotionChar, depth, tickCallback) {
+    if (BotState.hackEnabled && BotState.autoMove) {
+      if (!getGame() || !isPlayersTurn(getGame()))
+        return;
+      cancelPendingMove();
+      const thinkTime = BotState.moveTime;
+      const jitter = BotState.jitter ? Math.random() * BotState.jitter : 0;
+      const totalDelay = thinkTime + jitter;
+      const depthLabel = depth ? ` (D${depth})` : "";
+      BotState.statusInfo = `Thinking${depthLabel} (${(totalDelay / 1e3).toFixed(1)}s)...`;
+      if (BotState.onUpdateDisplay)
+        BotState.onUpdateDisplay(pa());
+      pendingMoveTimeoutId = setTimeout(async () => {
+        const g = getGame();
+        if (!g || !isPlayersTurn(g) || getFen(g) !== analysisFen) {
+          BotState.statusInfo = "Move canceled (state changed)";
+          if (BotState.onUpdateDisplay)
+            BotState.onUpdateDisplay(pa());
+          return;
+        }
+        BotState.statusInfo = "Making move...";
+        if (BotState.onUpdateDisplay)
+          BotState.onUpdateDisplay(pa());
+        const success = await makeMove(from, to, analysisFen, promotionChar);
+        if (success) {
+          BotState.statusInfo = "\u2713 Move made!";
+          if (BotState.onUpdateDisplay)
+            BotState.onUpdateDisplay(pa());
+        } else {
+          BotState.statusInfo = "\u274C Move failed \u2014 retrying...";
+          if (BotState.onUpdateDisplay)
+            BotState.onUpdateDisplay(pa());
+          Promise.resolve().then(() => (init_scheduler(), scheduler_exports)).then((module) => {
+            module.setLastFenProcessedMain("");
+            if (tickCallback) {
+              setTimeout(() => tickCallback(), 500);
+            }
+          });
+        }
+      }, totalDelay);
+    } else {
+      BotState.statusInfo = "Ready (manual)";
+      if (BotState.onUpdateDisplay)
+        BotState.onUpdateDisplay(pa());
+    }
+  }
+  function updateEvaluationBar(evaluation, playingAs) {
+    if (!boardCtx)
+      return;
+    const whiteBar = boardCtx.evalBarWrap.querySelector("#evaluationBarWhite");
+    const blackBar = boardCtx.evalBarWrap.querySelector("#evaluationBarBlack");
+    if (!whiteBar || !blackBar)
+      return;
+    let score = 0;
+    if (typeof evaluation === "string") {
+      if (evaluation === "-" || evaluation === "Error") {
+        whiteBar.style.height = "50%";
+        blackBar.style.height = "50%";
+        return;
+      }
+      if (evaluation.includes("M")) {
+        const m = parseInt(evaluation.replace("M", "").replace("+", ""), 10);
+        score = m > 0 ? 10 : -10;
+      } else {
+        score = parseFloat(evaluation);
+      }
+    } else {
+      score = parseFloat(evaluation);
+    }
+    if (isNaN(score)) {
+      whiteBar.style.height = "50%";
+      blackBar.style.height = "50%";
+      return;
+    }
+    const maxScore = 5;
+    const clampedScore = Math.max(-maxScore, Math.min(maxScore, score));
+    const whitePercent = 50 + clampedScore / maxScore * 50;
+    const blackPercent = 100 - whitePercent;
+    whiteBar.style.height = `${whitePercent}%`;
+    blackBar.style.height = `${blackPercent}%`;
+    const ourColor = getPlayerColor(getGame());
+    const ourEval = ourColor === "w" ? score : -score;
+    if (ourEval < -2) {
+      boardCtx.evalBarWrap.style.borderColor = "rgba(255, 100, 100, 0.5)";
+    } else if (ourEval > 2) {
+      boardCtx.evalBarWrap.style.borderColor = "rgba(100, 255, 100, 0.5)";
+    } else {
+      boardCtx.evalBarWrap.style.borderColor = "rgba(255, 255, 255, 0.2)";
+    }
+  }
+  var boardCtx, domObserver, pendingMoveTimeoutId, boardMoveObserver, mutationListeners, debounceTimer;
+  var init_board = __esm({
+    "src/board.js"() {
+      init_utils();
+      init_state();
+      boardCtx = null;
+      domObserver = null;
+      pendingMoveTimeoutId = null;
+      boardMoveObserver = null;
+      mutationListeners = /* @__PURE__ */ new Set();
+      debounceTimer = null;
+    }
+  });
+
+  // src/index.js
+  init_state();
+  init_utils();
+  init_board();
+  init_ui();
+
+  // src/controller.js
+  init_state();
+  init_utils();
+  init_board();
+  init_ui();
+  init_scheduler();
+  init_analysis();
+  init_san();
+  var BotController = class {
+    constructor() {
+      this.isActive = false;
+      this.tickTimer = null;
+      this.checkInterval = null;
+      this.lastFenSeen = "";
+      this.lastOpponentMove = null;
+      this.gameStarted = false;
+      this.gameEndDetected = false;
+      this.mutationCleanup = null;
+    }
+    init() {
+      this.startSettingsWatcher();
+      startDomBoardWatcher();
+      if (BotState.hackEnabled) {
+        this.start();
+      }
+    }
+    start() {
+      if (this.isActive)
+        return;
+      this.isActive = true;
+      console.log("GabiBot: Controller started.");
+      BotState.statusInfo = "Ready";
+      ui.updateDisplay(pa());
+      this.startTickLoop();
+      this.startGameCheckLoop();
+    }
+    stop() {
+      if (!this.isActive)
+        return;
+      this.isActive = false;
+      console.log("GabiBot: Controller stopped.");
+      this.stopTickLoop();
+      this.stopGameCheckLoop();
+      PositionCache.clear();
+      clearArrows();
+      cancelPendingMove();
+      BotState.statusInfo = "Bot disabled";
+      BotState.currentEvaluation = "-";
+      BotState.bestMove = "-";
+      ui.updateDisplay(pa());
+    }
+    toggle() {
+      if (this.isActive)
+        this.stop();
+      else
+        this.start();
+    }
+    // --- Main Logic Loop ---
+    startTickLoop() {
+      this.stopTickLoop();
+      startMoveWatcher();
+      if (!this.mutationCleanup) {
+        this.mutationCleanup = onBoardMutation(() => {
+          if (!this.isActive || !BotState.hackEnabled)
+            return;
+          this.tick();
+        });
+      }
+      const loop = () => {
+        if (!this.isActive || !BotState.hackEnabled)
+          return;
+        this.tick();
+        this.tickTimer = setTimeout(loop, 1e3);
+      };
+      loop();
+    }
+    stopTickLoop() {
+      if (this.tickTimer)
+        clearTimeout(this.tickTimer);
+      this.tickTimer = null;
+      stopMoveWatcher();
+      if (this.mutationCleanup) {
+        this.mutationCleanup();
+        this.mutationCleanup = null;
+      }
+    }
+    tick() {
+      invalidateGameCache();
+      const game = getGame();
+      if (!game)
+        return;
+      if (game.isGameOver && game.isGameOver()) {
+        this.handleInternalGameOver();
+        return;
+      }
+      const fen = getFen(game);
+      if (!fen)
+        return;
+      if (fen !== this.lastFenSeen) {
+        if (!this.gameStarted) {
+          this.gameStarted = true;
+          const playerColor = getPlayerColor(game);
+          const color = playerColor === "w" ? "White" : "Black";
+          ui.log(`Bot is playing ${color}`, "status");
+        }
+        if (this.lastFenSeen && isPlayersTurn(game)) {
+          const oppMove = this.extractLastMove(this.lastFenSeen, fen);
+          if (oppMove) {
+            ui.log(formatMove(this.lastFenSeen, oppMove), "opponent");
+          } else {
+            ui.log("...", "opponent");
+          }
+        }
+        this.lastFenSeen = fen;
+        cancelPendingMove();
+        clearArrows();
+      }
+      if (isPlayersTurn(game)) {
+        if (getLastFenProcessedMain() !== fen) {
+          scheduleAnalysis("main", fen, () => this.tick());
+        }
+      } else {
+        if (getLastFenProcessedPremove() !== fen) {
+          scheduleAnalysis("premove", fen);
+        } else {
+          this.setStatus(BotState.premoveEnabled ? "Waiting for opponent..." : "Pondering...");
+        }
+      }
+    }
+    handleInternalGameOver() {
+      if (BotState.statusInfo !== "Game finished") {
+        BotState.currentEvaluation = "GAME OVER";
+        BotState.bestMove = "-";
+        BotState.principalVariation = "Game ended";
+        BotState.statusInfo = "Game finished";
+        clearArrows();
+        ui.updateDisplay(pa());
+      }
+    }
+    // checkFailsafe was removed — it was the root cause of the infinite
+    // fail→reset→fail loop. When a move fails, the bot now simply waits
+    // for the board position to change (opponent move / new game).
+    // See tests/failsafe-loop.test.js for the proof.
+    setStatus(msg) {
+      if (BotState.statusInfo !== msg) {
+        BotState.statusInfo = msg;
+        ui.updateDisplay(pa());
+      }
+    }
+    /**
+     * Extract the last move from FEN change (opponent's move)
+     * Returns UCI notation
+     */
+    extractLastMove(prevFen, newFen) {
+      try {
+        const game = getGame();
+        if (game) {
+          const parseMove = (m) => {
+            if (!m)
+              return null;
+            if (typeof m === "string")
+              return m;
+            if (typeof m === "object") {
+              if (typeof m.uci === "string")
+                return m.uci;
+              if (typeof m.from === "string" && typeof m.to === "string") {
+                return m.from + m.to + (m.promo || m.promotion || "");
+              }
+            }
+            return null;
+          };
+          if (game.getLastMove) {
+            const lastMove = game.getLastMove();
+            const uci = parseMove(lastMove);
+            if (uci)
+              return uci;
+          }
+          if (game.getMoveHistory) {
+            const history = game.getMoveHistory();
+            if (history && history.length > 0) {
+              const last = history[history.length - 1];
+              const uci = parseMove(last?.move || last);
+              if (uci)
+                return uci;
+            }
+          }
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    }
+    // --- Game Check Loop (Start/End detection) ---
+    // Replaces gameStartInterval / gameEndInterval
+    startGameCheckLoop() {
+      this.stopGameCheckLoop();
+      this.checkInterval = setInterval(() => this.checkGameState(), 1e3);
+    }
+    stopGameCheckLoop() {
+      if (this.checkInterval)
+        clearInterval(this.checkInterval);
+      this.checkInterval = null;
+    }
+    checkGameState() {
+      const gameOverModal = document.querySelector(".game-over-modal-content");
+      if (gameOverModal && !this.gameEndDetected) {
+        this.gameEndDetected = true;
+        clearArrows();
+        cancelPendingMove();
+        BotState.statusInfo = "Game ended, preparing new game...";
+        BotState.currentEvaluation = "-";
+        BotState.bestMove = "-";
+        ui.updateDisplay(pa());
+        if (BotState.autoRematch) {
+          this.handleAutoRematch();
+        }
+      }
+      if (!gameOverModal && this.gameEndDetected) {
+        this.gameEndDetected = false;
+        this.gameStarted = false;
+        setLastFenProcessedMain("");
+        setLastFenProcessedPremove("");
+        this.lastFenSeen = "";
+        this.lastOpponentMove = null;
+        resetEngine();
+        ui.clearConsole();
+        const playerColor = getPlayerColor(getGame());
+        const color = playerColor === "w" ? "White" : "Black";
+        ui.log(`Bot is playing ${color}`, "status");
+        BotState.statusInfo = "Ready";
+        ui.updateDisplay(pa());
+        setTimeout(() => this.tick(), 500);
+      }
+    }
+    handleAutoRematch() {
+      console.log("GabiBot: Auto-queue sequence initiated");
+      setTimeout(() => {
+        const actions = [
+          { name: "Accept", sel: 'button[data-cy="game-over-modal-rematch-button"], .game-over-buttons-button', text: "Accept" },
+          { name: "Rematch", sel: '[data-cy="sidebar-game-over-rematch-button"]' },
+          { name: "New 1 Min Modal", sel: '[data-cy="game-over-modal-new-game-button"]' },
+          { name: "New 1 Min", sel: '[data-cy="sidebar-game-over-new-game-button"]' },
+          { name: "Arena Next", sel: '[data-cy="next-arena-game-button"]' },
+          { name: "Arena Request", sel: '[data-cy="request-arena-game"]' }
+        ];
+        for (const action of actions) {
+          const btns = document.querySelectorAll(action.sel);
+          for (const btn of btns) {
+            if (btn && btn.offsetParent !== null) {
+              if (action.text && !btn.textContent.toLowerCase().includes(action.text.toLowerCase())) {
+                continue;
+              }
+              console.log(`GabiBot: Clicking ${action.name}`);
+              btn.click();
+              return;
+            }
+          }
+        }
+      }, 1500);
+    }
+    // --- Settings / State Watcher ---
+    startSettingsWatcher() {
+      let lastHackEnabled = BotState.hackEnabled;
+      let lastUpdateSpeed = BotState.updateSpeed;
+      setInterval(() => {
+        if (BotState.hackEnabled !== lastHackEnabled) {
+          lastHackEnabled = BotState.hackEnabled;
+          if (BotState.hackEnabled)
+            this.start();
+          else
+            this.stop();
+          Settings.save();
+        }
+      }, 200);
+    }
+  };
+  var controller = new BotController();
+
+  // src/index.js
+  (async function() {
+    "use strict";
+    if (window.__GABIBOT_RUNNING__) {
+      console.log("GabiBot: Already running, skipping init.");
+      return;
+    }
+    window.__GABIBOT_RUNNING__ = true;
+    console.log("GabiBot: Script loaded, waiting for board...");
+    async function init() {
+      try {
+        BotState.onUpdateDisplay = (playingAs) => ui.updateDisplay(playingAs);
+        const board = await waitForElement(".board, chess-board, .board-layout-vertical, .board-layout-horizontal").catch(() => null);
+        await buildUI();
+        const boardEl = board || document.querySelector("chess-board") || document.querySelector(".board") || document.querySelector('[class*="board"]');
+        attachToBoard(boardEl);
+        controller.init();
+        console.log("GabiBot: Initialized.");
+      } catch (error) {
+        console.error("GabiBot Error:", error);
+        alert("GabiBot: Could not find chess board. Please refresh or check console.");
+      }
+    }
+    setTimeout(init, 3e3);
+  })();
+})();
